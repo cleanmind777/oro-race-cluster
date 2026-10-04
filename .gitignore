@@ -1,0 +1,10 @@
+# real config: tokens, IPs, paths. .env.example is the template that is tracked
+.env
+
+# the only durable copy of the race data lives here on main; never commit it
+Data/
+frontend/node_modules/
+frontend/dist/
+__pycache__/
+*.partial
+.DS_Store
