@@ -168,7 +168,13 @@ for defence in depth, and then every worker's `.env` needs the same value.
 | `MAIN_ORO_MAX_RPM` | `49` | request cap for main's metadata fetch |
 | `ORO_MAX_RPM` | `98` | cap for main's local worker — **set this to `49`** |
 | `WORKER_THREADS` | `4` | download threads for main's local worker |
+| `AUTO_RESUME` | `1` | continue an interrupted race on startup (section 10) |
+| `WATCH_INTERVAL_SEC` | `60` | how often to check whether a race is published yet |
+| `WATCH_REQUIRE_COMPLETE` | `1` | also wait for `race.status == RACE_COMPLETE` |
+| `PROBE_EPISODES` | `3` | episodes tried per check; one success means published |
+| `MAX_ITEM_FAILURES` | `3` | attempts before a file is given up as unavailable |
 | `UNIT_MAX_EPISODES` | `20` | episodes per work unit |
+| `UNIT_MAX_META` | `4` | metadata files per work unit |
 | `UNIT_STALE_SEC` | `180` | no file progress for this long ⇒ the unit is requeued |
 | `PYTHON` | `python3` | interpreter PM2 uses |
 
@@ -351,15 +357,32 @@ python3 oro_main.py start --race-id 51abddf9-0ea6-4afb-9b19-bd0bdc182af6 --label
 {"race_id": "51abddf9-...", "label": "race2", "phase": "metadata"}
 ```
 
+`"phase": "waiting"` instead means the logs are not public yet; main will start on its
+own (see below).
+
 This posts to the server that is already running under PM2; it does not start a second
 one. `409 race already running` means a race is still in progress.
 
 ### What happens next
 
-1. **metadata phase** — main reads the race, then each qualifier's runs and each included
-   eval run, writing every response unchanged. Episodes are queued as they are discovered,
-   so workers start downloading within seconds instead of waiting for the whole scan.
-2. **episode phase** — workers pull one small unit at a time until the queue is empty.
+0. **waiting phase** — only if the race's logs are not public yet. ORO publishes episode
+   logs some hours after a race ends, so you can start a race the moment it finishes and
+   leave it: main re-reads `race.json` every `WATCH_INTERVAL_SEC` (60 s), waits for
+   `status == "RACE_COMPLETE"`, and probes up to `PROBE_EPISODES` real episodes. While
+   those answer `404 ARTIFACT_NOT_FOUND` nothing is downloaded and the dashboard shows
+   the reason, the number of checks and the time waited. One successful probe is enough,
+   so a single missing artifact cannot block the start.
+1. **metadata phase** — `race.json`, then each qualifier's `runs.json` and each included
+   `evaluation_run.json`, written unchanged. The metadata files are themselves work units
+   (`UNIT_MAX_META` files each) handed out **before** any episode unit, so every VPS helps
+   with them; main parses each file as it lands and queues the next level from it. A race
+   with hundreds of eval runs therefore takes a couple of minutes here instead of the half
+   hour main needed when it did this alone.
+   Metadata is **re-fetched** after a wait, never trusted from disk, because a race's
+   qualifiers and episode lists can still change before publication.
+2. **episode phase** — workers pull one small unit at a time until the queue is empty. A
+   file that fails `MAX_ITEM_FAILURES` times is given up and counted as *unavailable*, so
+   one permanently missing episode cannot keep the race open.
 
 Only runs whose `race_id` matches, with `phase == "RACE"`, `is_included == true` and a
 status other than `STALE`, are downloaded. `AGENT_CODE` is never requested.
@@ -384,7 +407,7 @@ du -sh Data/races/race2
 
 ```
 race   : 51abddf9-...  label=race2  phase=episodes
-meta   : agents 158/158  runs 300/300  episodes 27000
+meta   : files 458/458  agents 158/158  runs 300/300  episodes 27000
 files  : done 14230/27000 (52.7%)  pending 12600  in-flight 170  pre-existing 0
 rate   : 318.0 files/min  eta 40m05s  429s 4  requeues 0  steals 2
 worker                status          done  units flight     epm  429       MB   seen
@@ -393,7 +416,14 @@ vps-fra-1             downloading     5300     265     20   112.4    0    598.7 
 vps-sgp-1             rate-limited    4810     241     20    88.3    3    543.1     2s
 ```
 
-The dashboard shows the same thing and refreshes every 1.5 s: both phases, cluster
+While a race is waiting for publication the first two lines look like this instead:
+
+```
+race   : 51abddf9-...  label=race2  phase=waiting
+waiting: episode logs are not published yet (404)  (checked 37x, every 60s)
+```
+
+The dashboard shows the same thing and refreshes every 1.5 s: all phases, cluster
 totals, files per minute, ETA, and one row per VPS with its recent EPM, in-flight count,
 429 count, bytes landed on main and last-seen age.
 
@@ -443,22 +473,45 @@ numbers instead of collecting 429s.
 
 ---
 
-## 10. Resume
+## 10. Resume, and stopping a race
 
-Start the same `race_id` again — from the dashboard or the CLI. Files that already exist
-with size > 0 are skipped at three points: when the queue is built, when a unit is handed
-out, and on the worker itself. The status line reports them as `pre-existing`, and the
-dashboard says *already on disk*.
+### After a crash, a restart or a reboot: automatic
 
-This is also the correct response to a crash, a reboot, or a stopped race: just start it
-again.
+Main writes the running race's `race_id` and label to `.oro-main-state.json` beside
+`oro_main.py`, and continues it when it starts again. You will see this in the log:
+
+```
+[main 12:00:01] resumed race 51abddf9-0ea6-4afb-9b19-bd0bdc182af6 -> race2; files already on disk are skipped
+```
+
+The workers reconnect on their own within seconds, so a `pm2 restart oro-main` mid-race
+costs you only the few episodes that were in flight. Set `AUTO_RESUME=0` in `.env` if you
+would rather start every race by hand; main then just logs that a race was interrupted.
+
+A resume is cheap because the queue is rebuilt from disk. Files that already exist with
+size > 0 are skipped at three points — when the queue is built, when a unit is handed out,
+and on the worker itself. The status line reports them as `pre-existing`, the dashboard as
+*already on disk*. Only `race.json` and one `runs.json` per qualifier are fetched again.
+
+Starting the same `race_id` by hand does exactly the same thing, so it is also the right
+move after `AUTO_RESUME=0`, or when you want to top up a race you stopped earlier.
+
+### Stopping a race on purpose
+
+```bash
+python3 oro_main.py stop     # or the "Stop race" button in the dashboard
+```
+
+Every file already downloaded is kept, the queue is dropped, and workers abandon their
+unit within a few seconds and go back to waiting. This also clears the resume marker, so
+a stop survives a restart. Starting the same `race_id` later picks up where you left off.
 
 ---
 
 ## 11. Day-to-day
 
 ```bash
-pm2 restart oro-main                 # restart the server (workers reconnect by themselves)
+pm2 restart oro-main                 # restart the server; a running race resumes itself
 pm2 restart oro-worker               # restart main's downloader
 pm2 stop oro-worker                  # stop main downloading; remote workers continue
 pm2 logs --lines 100                 # recent output from both apps
@@ -545,6 +598,8 @@ Never expose 5173 in production. Build the UI and let `oro-main` serve it.
 | workers log `403` | that worker's public IP is missing from `ALLOWED_IPS`. Check `pm2 logs oro-main` for `blocked <ip>` |
 | a worker's IP changed | update `ALLOWED_IPS`, then `pm2 start ecosystem.main.cjs` |
 | an edited `.env` seems ignored | you used `pm2 restart`; run `pm2 start ecosystem.main.cjs` instead |
+| a race restarted itself after you stopped main | that is `AUTO_RESUME=1` doing its job; use `python3 oro_main.py stop` to end a race, or set `AUTO_RESUME=0` |
+| `oro_main.py stop` says `no race is running` | the race already finished, or was stopped before |
 | main's worker logs `waiting for work from` another host | `MAIN_URL` is set in main's `.env`; comment it out so the local worker follows `BIND_PORT` |
 | workers log `401` | main has a `CLUSTER_TOKEN` the worker does not send, or they differ |
 | log says `+token` but you wanted none | a `CLUSTER_TOKEN` is exported in the shell that ran `pm2 start`; `unset` it and start again |

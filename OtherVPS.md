@@ -4,7 +4,8 @@ An extra machine runs one process, `oro-worker`. It:
 
 - **listens on no port at all** — it is an HTTP client, like a browser,
 - long-polls main for **one small unit** of work at a time,
-- downloads each episode from `api.oroagents.com`,
+- downloads each episode — and, early in a race, each metadata file — from
+  `api.oroagents.com`,
 - uploads each file to main **immediately** after downloading it,
 - keeps **no copy** of the race data (bytes are held in memory, never written to disk),
 - waits forever under PM2, so a new race needs no command on this machine.
@@ -67,8 +68,8 @@ when the machine sits behind NAT.
 Only four files are needed:
 
 ```
-oro_worker.py
-ecosystem.worker.cjs
+oro_worker.py            # the only file that actually does the work
+ecosystem.worker.cjs     # optional on Windows, where PM2 can start the .py directly
 pm2_start.cjs            # required by ecosystem.worker.cjs
 .env.example             # copy to .env and edit (section 3.2 / 4.2)
 ```
@@ -174,8 +175,8 @@ npm install -g pm2
 
 ### 4.2 Configure `.env`
 
-Same single file as on Linux, plus one Windows-specific line: PM2 must be told the
-interpreter is `python`, not `python3`.
+Same single file as on Linux. Nothing Windows-specific is required: the PM2 config
+already asks for `python` rather than `python3` when it runs on Windows.
 
 ```powershell
 cd C:\oro-race-cluster
@@ -189,11 +190,10 @@ WORKER_ID=win-nyc-1
 WORKER_THREADS=4
 ORO_MAX_RPM=98
 CLUSTER_TOKEN=
-PYTHON=python
 ```
 
-If `python` is not on PATH, give the full path instead (forward slashes or doubled
-backslashes both work):
+Add `PYTHON` only if `python` is not on PATH, giving the full path (forward slashes or
+doubled backslashes both work):
 
 ```ini
 PYTHON=C:/Users/me/AppData/Local/Programs/Python/Python312/python.exe
@@ -201,10 +201,41 @@ PYTHON=C:/Users/me/AppData/Local/Programs/Python/Python312/python.exe
 
 ### 4.3 Start
 
+A worker needs no config file, because every setting comes from `.env`. On Windows this
+direct form is the one to use:
+
 ```powershell
-pm2 start ecosystem.worker.cjs
+cd C:\oro-race-cluster
+pm2 start oro_worker.py --name oro-worker --interpreter python
+pm2 status                      # must list oro-worker
 pm2 save
 ```
+
+`WRITE_LOCAL` defaults to `0`, which is upload mode, so this is equivalent to the config
+file. Pass the full path to `python.exe` instead of `python` if it is not on PATH.
+
+<details>
+<summary>Using <code>ecosystem.worker.cjs</code> on Windows</summary>
+
+`pm2 start ecosystem.worker.cjs` also works, but it has one more moving part. PM2 only
+recognises `.json`, `.yaml` and `*.config.cjs` as config files, so a `.cjs` file is run
+as a **script**; ours hands the app list to PM2 itself and then deletes the wrapper entry
+PM2 made for it. On Linux that is seamless. On Windows it depends on PM2 being callable
+as `pm2.cmd` from inside a PM2-managed process, which does not hold on every setup.
+
+You can tell at a glance: afterwards `pm2 status` must list **`oro-worker`**. If it keeps
+listing `ecosystem.worker` instead — often with the restart counter climbing or the
+status stuck at `stopping` — the handover failed:
+
+```powershell
+pm2 logs ecosystem.worker --lines 30 --nostream   # prints the exact reason
+pm2 delete ecosystem.worker
+```
+
+then use the direct form above. The launcher prints the underlying `pm2` error and leaves
+its generated config in `%TEMP%`, so you can also start that by hand if you prefer.
+
+</details>
 
 ### 4.4 Verify
 
@@ -213,8 +244,9 @@ pm2 status
 pm2 logs oro-worker --lines 5 --nostream
 ```
 
-Expect the same `waiting for work ... write_local=0` line as on Linux. Then check from
-any machine that main lists this `worker_id`:
+Expect the same `waiting for work ... write_local=0` line as on Linux. A
+`WARNING: MAIN_URL is not set` line means this machine is asking itself for work — fix
+`MAIN_URL` in `.env`. Then check from any machine that main lists this `worker_id`:
 
 ```powershell
 curl.exe http://203.0.113.10:8080/api/workers
@@ -298,10 +330,12 @@ inbound rule at all: the worker never listens on a port.
 
 ## 6. Variables
 
-All of these go in `.env`. Apply edits with `pm2 start ecosystem.worker.cjs`, which
-re-reads the file; a plain `pm2 restart` keeps the values the app was started with. A
-real environment variable wins for a one-off change:
-`ORO_MAX_RPM=40 pm2 restart oro-worker --update-env`.
+All of these go in `.env`. To apply an edit, run `pm2 start ecosystem.worker.cjs` again
+if that is how you started the worker: PM2 remembers the environment an app was started
+with, so a plain `pm2 restart` would reuse the old values. If you started it directly
+with `pm2 start oro_worker.py ...` (the Windows form), nothing was snapshotted and
+`pm2 restart oro-worker` is enough. A real environment variable wins for a one-off
+change: `ORO_MAX_RPM=40 pm2 restart oro-worker --update-env`.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -310,7 +344,7 @@ real environment variable wins for a one-off change:
 | `CLUSTER_TOKEN` | *(empty = not sent)* | only if main has one; must match exactly |
 | `WORKER_THREADS` | `4` | parallel ORO downloads, all under one limiter |
 | `ORO_MAX_RPM` | `98` | per-process cap toward ORO |
-| `PYTHON` | `python3` | set to `python` on Windows |
+| `PYTHON` | `python3`, or `python` on Windows | only needed for a non-PATH interpreter, as a full path |
 | `WRITE_LOCAL` | set to `0` by PM2 | never change it; `1` is only for main's own worker |
 
 ### When to lower `ORO_MAX_RPM`
@@ -335,10 +369,18 @@ dashboard as `rate-limited`), and carry on by itself.
 
 ## 7. What this machine does and does not keep
 
-Each episode body is held in memory, uploaded to main, and dropped. No temp files, no
+Each response body is held in memory, uploaded to main, and dropped. No temp files, no
 partial copies, no end-of-job tar or rsync. An item is not counted as done until main
 confirms the upload, and if main is briefly down the upload retries with backoff until it
 succeeds, so nothing is silently lost.
+
+A unit is either metadata (`runs.json` / `evaluation_run.json`, logged as *metadata
+files*) or episodes — the work is identical from this machine's point of view. Main hands
+out the metadata first so that every VPS helps build the file list; it then parses each
+file this machine uploads to find the next level of work.
+
+If a race has just finished, main may be waiting for ORO to publish the logs. This
+machine simply stays `waiting` meanwhile; no action is needed here.
 
 If main is restarted or unreachable, the worker logs `main unreachable` and keeps retrying.
 It rejoins by itself; no action needed here.
@@ -357,12 +399,13 @@ pm2 start oro-worker            # put it back; it will get work within seconds
 pm2 flush                       # truncate logs
 ```
 
-To change main's address, the rate cap or the token, edit `.env` and start from the
-config file again so the new values are read:
+To change main's address, the rate cap or the token, edit `.env` and start again so the
+new values are read:
 
 ```bash
 nano .env
-pm2 start ecosystem.worker.cjs
+pm2 start ecosystem.worker.cjs       # if you started it from the config file
+pm2 restart oro-worker               # if you started oro_worker.py directly
 ```
 
 After copying a new `oro_worker.py`: `pm2 restart oro-worker`.
@@ -388,16 +431,17 @@ units immediately, including stolen tail work from slower machines.
 | --- | --- |
 | `main unreachable` | `MAIN_URL` missing the port, wrong IP, or main's firewall / cloud security group blocks this IP. Test with `curl http://MAIN:8080/api/health` |
 | `403 ... is not in ALLOWED_IPS` | this machine's public IP is not listed on main; add it to main's `.env` and run `pm2 start ecosystem.main.cjs` there |
-| an edited `.env` seems ignored | you used `pm2 restart`; run `pm2 start ecosystem.worker.cjs` instead |
+| an edited `.env` seems ignored | you started from the config file, where PM2 keeps the first environment; run `pm2 start ecosystem.worker.cjs` instead of `pm2 restart` |
 | worked before, now 403 | this machine's public IP changed; update main's `ALLOWED_IPS` |
 | `CLUSTER_TOKEN does not match main` (401) | token typo, or main has one and this `.env` leaves it empty; fix `.env` and `pm2 restart oro-worker` |
 | worker not in the dashboard | it is not running (`pm2 status`), or it cannot reach main |
 | row shows `offline` | process died or lost its network; `pm2 logs oro-worker`. Main requeues its work automatically after 180 s |
 | row shows `rate-limited` often | this IP is near the ORO cap; lower `ORO_MAX_RPM` |
-| it never gets work | normal if no race is running, or the race is finished; start a race on main |
+| it never gets work | normal if no race is running, or the race is finished or was stopped; start a race on main |
+| log says `job ... was requeued by main, dropping it` | normal. Main either stopped the race, handed those episodes to a faster machine, or restarted; this worker goes back to waiting |
 | files done stays 0 while others climb | check for 429s in `pm2 logs oro-worker`, then lower `ORO_MAX_RPM` |
 | `pm2 start` says `Script already launched` | a stray `ecosystem.worker` entry from an interrupted start; `pm2 delete ecosystem.worker` then start again |
-| `pm2 list` shows an `ecosystem.worker` app | same leftover wrapper; `pm2 delete ecosystem.worker`. Only `oro-worker` should be listed |
-| Windows: `interpreter python3 not found` | set `$env:PYTHON = "python"` (or the full `python.exe` path) and start again |
+| `ecosystem.worker` is listed and `oro-worker` is not | the handover to PM2 failed, common on Windows. `pm2 logs ecosystem.worker --lines 30 --nostream` says why; then `pm2 delete ecosystem.worker` and use the direct start in section 4.3. Only `oro-worker` should ever be listed |
+| Windows: `interpreter python3 not found` | an older copy of the PM2 files; update them, or set `PYTHON` in `.env` to the full `python.exe` path |
 | Windows: nothing runs after reboot | `pm2 save` was not run, or the Task Scheduler task runs as a different user than the one that saved |
 | adding the machine did not speed things up | it shares a public IP with another worker |

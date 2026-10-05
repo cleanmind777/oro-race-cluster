@@ -6,7 +6,7 @@ const { loadEnvFile } = require("./pm2_start.cjs");
 
 const ROOT = __dirname;
 const env = loadEnvFile(ROOT);
-const PYTHON = env.PYTHON || "python3";
+const PYTHON = env.PYTHON || (process.platform === "win32" ? "python" : "python3");
 
 const apps = [
   {

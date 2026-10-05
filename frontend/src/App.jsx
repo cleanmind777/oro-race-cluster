@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { getStatus, getToken, setToken, startRace } from "./api.js";
+import { getStatus, getToken, setToken, startRace, stopRace } from "./api.js";
 
 const POLL_MS = 1500;
 
@@ -31,7 +31,9 @@ function StartRaceForm({ status, onStarted }) {
   const [token, setTok] = useState(getToken());
 
   const running =
-    status && ["metadata", "episodes"].includes(status.phase) && !status.complete;
+    status &&
+    ["waiting", "metadata", "episodes"].includes(status.phase) &&
+    !status.complete;
 
   async function submit(event) {
     event.preventDefault();
@@ -39,6 +41,20 @@ function StartRaceForm({ status, onStarted }) {
     setBusy(true);
     try {
       await startRace(raceId, label);
+      onStarted();
+    } catch (err) {
+      setError(String(err.message || err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function stop() {
+    if (!window.confirm("Stop this race? Files already downloaded are kept.")) return;
+    setError("");
+    setBusy(true);
+    try {
+      await stopRace();
       onStarted();
     } catch (err) {
       setError(String(err.message || err));
@@ -81,27 +97,71 @@ function StartRaceForm({ status, onStarted }) {
           />
         </label>
         <button type="submit" disabled={busy || !raceId.trim()}>
-          {busy ? "Starting..." : running ? "Race running" : "Start race"}
+          {busy
+            ? "Starting..."
+            : status && status.phase === "waiting"
+            ? "Waiting for publication"
+            : running
+            ? "Race running"
+            : "Start race"}
         </button>
+        {running && (
+          <button type="button" className="danger" onClick={stop} disabled={busy}>
+            Stop race
+          </button>
+        )}
       </div>
       {error && <div className="error">{error}</div>}
       {running && (
         <div className="hint">
-          A race is already running. Starting the same race_id again after it ends
-          skips files that are already on disk.
+          This race is already under way, and main picks it up again by itself
+          if it restarts. Stopping keeps every file already downloaded;
+          starting the same race_id later skips them.
         </div>
       )}
     </form>
   );
 }
 
+function WaitBar({ status }) {
+  const watch = status.watch || {};
+  const since = status.started_at
+    ? Math.round((status.now - status.started_at) / 60)
+    : 0;
+  return (
+    <div className="panel phases">
+      <div className="phase">
+        <div className="phase-head">
+          <span className="dot live" />
+          <strong>0. waiting for publication</strong>
+          <span className="hint">
+            {watch.note || "checking"} &middot; checked {watch.checks || 0}&times;
+            {watch.interval ? ` every ${Math.round(watch.interval)}s` : ""}
+            {since ? ` · waiting ${since} min` : ""}
+          </span>
+        </div>
+        <div className="bar">
+          <div className="fill meta waiting" style={{ width: "100%" }} />
+        </div>
+      </div>
+      <div className="hint">
+        ORO publishes episode logs some hours after a race ends. Main keeps
+        checking and starts the cluster by itself, re-reading the metadata then
+        in case it changed while waiting.
+      </div>
+    </div>
+  );
+}
+
 function PhaseBar({ status }) {
   const meta = status.metadata;
   const totals = status.totals;
-  const metaPct = meta.agents_total
-    ? Math.round((meta.agents_done / meta.agents_total) * 100)
+  const metaPct = meta.files_total
+    ? Math.round((meta.files_done / meta.files_total) * 100)
     : 0;
-  const metaDone = status.phase !== "metadata" && status.phase !== "idle";
+  const metaDone = !["metadata", "idle", "waiting"].includes(status.phase);
+
+  if (status.phase === "waiting") return <WaitBar status={status} />;
 
   return (
     <div className="panel phases">
@@ -110,8 +170,9 @@ function PhaseBar({ status }) {
           <span className={`dot ${status.phase === "metadata" ? "live" : metaDone ? "ok" : ""}`} />
           <strong>1. metadata</strong>
           <span className="hint">
-            qualifiers {meta.agents_done}/{meta.agents_total || "?"} &middot; included
-            RACE runs {meta.runs_saved}/{meta.runs_included} &middot; episodes found{" "}
+            files {meta.files_done}/{meta.files_total || "?"} &middot; qualifiers{" "}
+            {meta.agents_done}/{meta.agents_total || "?"} &middot; included RACE runs{" "}
+            {meta.runs_saved}/{meta.runs_included} &middot; episodes found{" "}
             {meta.episodes_found}
             {meta.oro_429 ? ` · ${meta.oro_429} 429s` : ""}
           </span>
@@ -127,6 +188,7 @@ function PhaseBar({ status }) {
           <span className="hint">
             {totals.done}/{totals.total} files &middot; {totals.percent}%
             {totals.preexisting ? ` (${totals.preexisting} already on disk)` : ""}
+            {status.given_up ? ` · ${status.given_up} unavailable` : ""}
           </span>
         </div>
         <div className="bar">

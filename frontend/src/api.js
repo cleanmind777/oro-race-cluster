@@ -31,3 +31,13 @@ export async function startRace(raceId, label) {
   if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
   return body;
 }
+
+export async function stopRace() {
+  const res = await fetch("/api/races/stop", {
+    method: "POST",
+    headers: headers({ "Content-Type": "application/json" }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+  return body;
+}

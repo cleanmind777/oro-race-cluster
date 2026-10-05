@@ -91,7 +91,13 @@ values. A real environment variable still wins for a one-off,
 | `WORKER_THREADS` | workers | `4` | ORO threads, all under one limiter |
 | `ORO_MAX_RPM` | workers | `98` | per **process** cap toward ORO; use `49` on main |
 | `WRITE_LOCAL` | set by PM2 | `0` | `1` for main's worker: write to disk, don't upload |
+| `AUTO_RESUME` | main | `1` | continue an interrupted race when main starts again |
+| `WATCH_INTERVAL_SEC` | main | `60` | how often to check whether a race is published yet |
+| `WATCH_REQUIRE_COMPLETE` | main | `1` | also wait for `race.status == RACE_COMPLETE` |
+| `PROBE_EPISODES` | main | `3` | episodes tried per check; one success means published |
+| `MAX_ITEM_FAILURES` | main | `3` | attempts before a file is given up as unavailable |
 | `UNIT_MAX_EPISODES` | main | `20` | episodes per work unit |
+| `UNIT_MAX_META` | main | `4` | metadata files per work unit |
 | `UNIT_STALE_SEC` | main | `180` | no progress for this long ⇒ requeue the unit |
 | `PYTHON` | all | `python3` | set to `python` on Windows |
 
@@ -144,17 +150,38 @@ python3 oro_main.py start --race-id 51abddf9-0ea6-4afb-9b19-bd0bdc182af6 --label
 
 Both work while `oro-main` is already serving; the CLI just POSTs to it.
 
+### A race whose logs are not public yet
+
+ORO publishes episode logs some hours after a race ends, and the race metadata can still
+change in the meantime. You do not have to wait for that or watch for it: start the race
+straight away and main enters the **waiting** phase, where it
+
+1. re-reads `race.json` every `WATCH_INTERVAL_SEC` (default 60s) and, with
+   `WATCH_REQUIRE_COMPLETE=1`, waits for `status == "RACE_COMPLETE"`;
+2. then probes up to `PROBE_EPISODES` real episodes — while they answer
+   `404 ARTIFACT_NOT_FOUND` the logs are not published yet (one success is enough, so a
+   single missing artifact cannot block the start);
+3. starts the cluster by itself as soon as a probe succeeds.
+
+Nothing is downloaded while it waits, and the dashboard shows the reason, the number of
+checks and how long it has been waiting. Because the metadata may have changed while
+waiting, every metadata file is then fetched **again** rather than trusted from disk, so
+you cannot end up with the shorter episode list the race had before it was published.
+A restart during the waiting phase resumes waiting.
+
 ## Watch
 
 ```bash
 pm2 status                 # processes alive on this machine
 pm2 logs oro-worker        # what this machine is downloading
 python3 oro_main.py status # cluster table in the terminal
+python3 oro_main.py stop   # stop the race; downloaded files are kept
 curl -s localhost:8080/api/status | python3 -m json.tool
 find Data/races/race2 -path '*/episodes/*' | wc -l   # episode files on main
 ```
 
-The UI auto-refreshes every 1.5s: metadata phase, then episode phase, cluster
+The UI auto-refreshes every 1.5s: the waiting phase if the logs are not public yet, then
+the metadata phase (with its own file counter), then the episode phase, cluster
 done/remaining/in-flight, files per minute, ETA, and a row per VPS with its recent EPM,
 in-flight count, 429 count, bytes landed on main and last-seen age.
 
@@ -179,10 +206,19 @@ Endpoints used: `/v1/public/races/{id}`, `/v1/public/agent-versions/{id}/runs`,
 
 ## Resume
 
-Start the same `race_id` again. Files that already exist with size > 0 are skipped — on
-enqueue, again when a unit is handed out, and again on the worker itself. The UI reports
-them as *already on disk*. Interrupted downloads never leave half files behind: writes go
-to `*.partial` and are then renamed.
+Main remembers the running race in `.oro-main-state.json`, so a crash, a `pm2 restart` or
+a reboot continues by itself (`AUTO_RESUME=1`, the default) — the startup log says
+`resumed race ...`. Stopping a race, from the dashboard button or
+`python3 oro_main.py stop`, clears that marker, so a stop stays stopped.
+
+Either way the work is picked up from disk: files that already exist with size > 0 are
+skipped on enqueue, again when a unit is handed out, and again on the worker itself. The
+UI reports them as *already on disk*. Only the handful of episodes in flight at the moment
+of the interruption are fetched twice.
+
+Nothing half-written survives an interruption: every file is written to `*.partial` and
+renamed, and an upload that stops mid-transfer is rejected rather than saved, so resume
+cannot mistake a truncated episode for a finished one.
 
 ## Dynamic queue (equal finish times)
 
@@ -199,7 +235,17 @@ exactly **one** unit per request:
   next progress call and drops them.
 - If a unit makes no progress for `UNIT_STALE_SEC` (hung or disconnected machine), it goes
   back to the queue.
+- A file that keeps failing is dropped after `MAX_ITEM_FAILURES` attempts (default 3) and
+  counted as *unavailable*, so one episode that is permanently 404 cannot hold the race
+  open for ever.
 - The race is done when the queue is empty and nothing is in flight.
+
+**Metadata is distributed too.** `runs.json` and `evaluation_run.json` are work units of
+their own (`UNIT_MAX_META` files each) and they are always handed out before any episode
+unit, so every VPS helps build the file list instead of main fetching thousands of
+metadata files alone — on a large race that is the difference between half an hour and a
+couple of minutes. Main parses each metadata file as it lands and queues the next level
+from it, and the episode phase only begins once no metadata is outstanding.
 
 The per-VPS bars show **recent measured EPM**, not an assigned target, so they move as
 machines speed up or slow down.
@@ -317,6 +363,7 @@ briefly down. There is no end-of-job tar or rsync, so Windows workers need no ex
 | `GET /api/status` | UI login | everything the UI shows |
 | `GET /api/workers` | UI login | per-VPS detail |
 | `POST /api/races` | UI login | `{race_id, label}` — start/resume a race |
+| `POST /api/races/stop` | UI login | stop the race, keep the files, do not auto-resume |
 | `GET /api/work?worker_id=` | IP + token | long-poll ~60s → `204` idle, or `200` one unit |
 | `PUT /api/upload?label=&relpath=&worker_id=&job_id=` | IP + token | raw body = file bytes; idempotent |
 | `POST /api/work/{job_id}/progress` | IP + token | `{done_relpaths, bytes, new_429}` heartbeat |

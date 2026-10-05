@@ -12,7 +12,7 @@ const apps = [
   {
     name: "oro-worker",
     script: "oro_worker.py",
-    interpreter: env.PYTHON || "python3",
+    interpreter: env.PYTHON || (process.platform === "win32" ? "python" : "python3"),
     cwd: ROOT,
     autorestart: true,
     max_restarts: 50,

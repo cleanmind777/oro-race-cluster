@@ -286,3 +286,19 @@ tr.offline td {
   gap: 9px;
   align-items: baseline;
 }
+
+button.danger {
+  background: #2a1416;
+  border-color: #5c2b2f;
+  color: #ff9c9c;
+}
+button.danger:hover:not(:disabled) {
+  background: #3a1a1d;
+  border-color: #7c3a40;
+}
+
+.fill.meta.waiting {
+  background: repeating-linear-gradient(
+    90deg, #2b3b52 0 10px, #1d2a3b 10px 20px
+  );
+}

@@ -331,13 +331,15 @@ def progress_reporter(job_id: str, stop: threading.Event) -> None:
 def run_job(job: dict) -> None:
     job_id, label = job["job_id"], job["label"]
     items = job.get("items") or []
-    log(f"job {job_id}: {len(items)} episodes -> "
+    kind = "metadata files" if job.get("kind") == "metadata" else "episodes"
+    log(f"job {job_id}: {len(items)} {kind} -> "
         f"{'local disk' if WRITE_LOCAL else 'upload to main'}")
 
     work: queue.Queue = queue.Queue()
     for item in items:
         work.put(item)
     errors: list[str] = []
+    failed: list[str] = []
     errors_lock = threading.Lock()
     stop = threading.Event()
     reporter = threading.Thread(target=progress_reporter, args=(job_id, stop),
@@ -358,6 +360,7 @@ def run_job(job: dict) -> None:
             except Exception as err:  # noqa: BLE001 - one bad episode must not kill the job
                 with errors_lock:
                     errors.append(f"{item['relpath']}: {err}")
+                    failed.append(item["relpath"])  # main counts attempts per file
                 log(f"item failed {item['relpath']}: {err}")
             finally:
                 work.task_done()
@@ -382,6 +385,7 @@ def run_job(job: dict) -> None:
 
     action = "fail" if errors else "done"
     final["error"] = "; ".join(errors[:3]) if errors else None
+    final["failed_relpaths"] = failed
     try:
         main_request("POST", f"/api/work/{job_id}/{action}",
                      data=json.dumps(final).encode(), timeout=60)

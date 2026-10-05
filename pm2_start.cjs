@@ -9,9 +9,12 @@ const os = require("os");
 const path = require("path");
 const { spawn, spawnSync } = require("child_process");
 
-// vars PM2 injects into the wrapper that must not leak into the real apps
+// vars PM2 injects into the wrapper that must not leak into the real apps.
+// PM2_HOME is the exception: it says which daemon to talk to, and dropping it
+// would create the apps in a different one than `pm2 status` shows.
 const PM2_VARS =
-  /^(pm_|PM2_|PM_)|^(name|NODE_APP_INSTANCE|unique_id|exec_interpreter|instance_var|env_name)$/;
+  /^(pm_|PM2_|PM_)|^(name|NODE_APP_INSTANCE|unique_id|exec_interpreter|instance_var|env_name)$/i;
+const PM2_KEEP = /^PM2_HOME$/i;
 
 const WIN = process.platform === "win32";
 
@@ -58,9 +61,15 @@ function selfStart(mod, apps) {
   const root = path.dirname(mod.filename);
   const dotenv = parseEnvFile(root);
   const env = Object.fromEntries(
-    Object.entries(loadEnvFile(root)).filter(([k]) => !PM2_VARS.test(k))
+    Object.entries(loadEnvFile(root))
+      .filter(([k]) => PM2_KEEP.test(k) || !PM2_VARS.test(k))
   );
-  const run = (args) => spawnSync("pm2", args, { stdio: "inherit", shell: WIN, env });
+  // Windows needs the .cmd and, since Node 20, a shell to run it; with a shell
+  // the args are joined verbatim, so anything with a space must be quoted.
+  const PM2 = WIN ? "pm2.cmd" : "pm2";
+  const quote = (a) => (WIN && /\s/.test(a) ? `"${a}"` : a);
+  const run = (args) =>
+    spawnSync(PM2, args.map(quote), { shell: WIN, encoding: "utf8", env });
 
   // absolute script paths: PM2 resolves relative ones against the config file,
   // which here lives in the temp dir. watch:false because the data dir lives
@@ -79,24 +88,34 @@ function selfStart(mod, apps) {
   fs.writeFileSync(tmp, JSON.stringify(config, null, 2));
 
   for (const app of apps) {
-    spawnSync("pm2", ["delete", app.name], { stdio: "ignore", shell: WIN, env });
+    run(["delete", app.name]); // not there yet on a first start; failure is fine
   }
   const res = run(["start", tmp]);
-  fs.unlinkSync(tmp);
   if (res.status !== 0) {
-    console.error("[pm2_start] pm2 start failed");
+    console.error(`[pm2_start] \`${PM2} start\` failed` +
+                  (res.status === null ? "" : ` (exit ${res.status})`));
+    if (res.error) console.error(`[pm2_start] ${res.error.message}`);
+    for (const out of [res.stdout, res.stderr]) {
+      if (out && out.trim()) console.error(out.trim());
+    }
+    console.error(`[pm2_start] the generated config is still at ${tmp}\n` +
+                  `[pm2_start] start it by hand with: ${PM2} start "${tmp}"`);
     process.exitCode = 1;
-    return;
+  } else {
+    if (res.stdout && res.stdout.trim()) console.log(res.stdout.trim());
+    fs.unlinkSync(tmp);
+    console.log(`[pm2_start] started ${apps.map((a) => a.name).join(", ")}; ` +
+                "run `pm2 save && pm2 startup` to keep them across reboots");
   }
 
-  // Drop the wrapper app PM2 created for this file, or it restart-loops.
+  // Drop the wrapper app PM2 created for this file, or it restart-loops - also
+  // after a failure, so the error above is printed once instead of forever.
   // Detached, because that delete also kills this very process. In fork mode
   // argv[1] is PM2's own container, so the app name comes from the env.
   const self = process.env.name ||
     path.basename(process.argv[1] || __filename).replace(/\.[cm]?js$/, "");
-  spawn("pm2", ["delete", self], { detached: true, stdio: "ignore", shell: WIN, env }).unref();
-  console.log(`[pm2_start] started ${apps.map((a) => a.name).join(", ")}; ` +
-              "run `pm2 save && pm2 startup` to keep them across reboots");
+  spawn(PM2, [quote("delete"), quote(self)],
+        { detached: true, stdio: "ignore", shell: WIN, env }).unref();
 }
 
 module.exports = { selfStart, loadEnvFile };

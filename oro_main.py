@@ -76,12 +76,27 @@ UI_ALLOWED_IPS = os.environ.get("UI_ALLOWED_IPS", "")
 UI_MAX_FAILS = int(os.environ.get("UI_MAX_FAILS", "10"))
 UI_BAN_SEC = float(os.environ.get("UI_BAN_SEC", "300"))
 DATA_DIR = Path(os.environ.get("DATA_DIR") or (ROOT / "Data" / "races")).resolve()
+# which race is in progress, so a restart continues instead of forgetting; kept
+# out of DATA_DIR because only raw API bodies belong there
+STATE_FILE = Path(os.environ.get("STATE_FILE") or (ROOT / ".oro-main-state.json"))
+AUTO_RESUME = os.environ.get("AUTO_RESUME", "1").strip() not in ("0", "false", "no")
 DIST_DIR = Path(os.environ.get("DIST_DIR") or (ROOT / "frontend" / "dist")).resolve()
 
 # main's metadata fetch shares its public IP with main's local worker, so it
 # takes half of the ~98/min budget by default
 MAX_RPM = int(os.environ.get("MAIN_ORO_MAX_RPM") or os.environ.get("ORO_MAX_RPM") or "49")
 UNIT_MAX_EPISODES = int(os.environ.get("UNIT_MAX_EPISODES", "20"))
+# metadata is fetched by the whole cluster too, in smaller units so that one
+# machine cannot sit on the list of episodes everyone else is waiting for
+UNIT_MAX_META = int(os.environ.get("UNIT_MAX_META", "4"))
+# how often to re-check whether a race's logs have been published, and whether
+# to insist the race itself is over first
+WATCH_INTERVAL_SEC = float(os.environ.get("WATCH_INTERVAL_SEC", "60"))
+WATCH_REQUIRE_COMPLETE = os.environ.get("WATCH_REQUIRE_COMPLETE", "1").strip() \
+    not in ("0", "false", "no")
+# a file the API never returns must not be retried for ever
+MAX_ITEM_FAILURES = int(os.environ.get("MAX_ITEM_FAILURES", "3"))
+PROBE_EPISODES = max(1, int(os.environ.get("PROBE_EPISODES", "3")))
 LONGPOLL_SEC = float(os.environ.get("LONGPOLL_SEC", "60"))
 UNIT_STALE_SEC = float(os.environ.get("UNIT_STALE_SEC", "180"))
 STEAL_MIN_ITEMS = int(os.environ.get("STEAL_MIN_ITEMS", "4"))
@@ -339,11 +354,35 @@ def safe_dest(label: str, relpath: str) -> Path:
     return dest
 
 
+def is_meta_relpath(relpath: str) -> bool:
+    return relpath == "race.json" or relpath.endswith(
+        ("/runs.json", "/evaluation_run.json"))
+
+
 def write_atomic(dest: Path, data: bytes) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_name(dest.name + ".partial")
     tmp.write_bytes(data)
     os.replace(tmp, dest)
+
+
+def save_race_state(race_id: str | None, label: str | None, complete: bool) -> None:
+    """Remember the race across restarts. Best effort: never break a download."""
+    try:
+        write_atomic(STATE_FILE, json.dumps({
+            "race_id": race_id, "label": label, "complete": complete,
+            "saved_at": time.time(),
+        }, indent=2).encode())
+    except OSError as err:
+        log(f"could not write {STATE_FILE}: {err}")
+
+
+def load_race_state() -> dict | None:
+    try:
+        saved = json.loads(STATE_FILE.read_bytes())
+    except (OSError, json.JSONDecodeError):
+        return None
+    return saved if isinstance(saved, dict) else None
 
 
 def exists_nonempty(path: Path) -> bool:
@@ -398,12 +437,22 @@ class State:
         self.cond = threading.Condition(threading.RLock())
         self.race_id: str | None = None
         self.label: str | None = None
-        self.phase = "idle"  # idle | metadata | episodes | complete | error
+        # idle | waiting | metadata | episodes | stopped | error
+        self.phase = "idle"
         self.started_at: float | None = None
         self.finished_at: float | None = None
         self.meta = {"agents_total": 0, "agents_done": 0, "runs_included": 0,
                      "runs_saved": 0, "episodes_found": 0}
         self.pending: collections.deque[list[dict]] = collections.deque()
+        # metadata units are handed out before episode units, always
+        self.pending_meta: collections.deque[list[dict]] = collections.deque()
+        # metadata files that have landed and still need parsing
+        self.to_expand: collections.deque[str] = collections.deque()
+        self.meta_files_total = 0
+        self.meta_files_done = 0
+        self.failures: dict[str, int] = {}
+        self.given_up: set[str] = set()
+        self.watch = {"checks": 0, "note": "", "last_check": 0.0}
         self.jobs: dict[str, dict] = {}
         self.workers: dict[str, Worker] = {}
         self.done_set: set[str] = set()
@@ -415,6 +464,7 @@ class State:
         self.metadata_429 = 0
         self.requeues = 0
         self.steals = 0
+        self.generation = 0  # bumped on start/stop so a stale metadata thread quits
         self.meta_thread: threading.Thread | None = None
         self.limiter = RateLimiter()
 
@@ -424,17 +474,31 @@ class State:
         log(f"{kind}: {msg}")
 
     def in_flight_count(self) -> int:
-        return sum(1 for j in self.jobs.values() for i in j["items"]
-                   if i["relpath"] not in self.done_set)
+        return sum(1 for j in self.jobs.values() if j.get("kind") != "metadata"
+                   for i in j["items"] if i["relpath"] not in self.done_set)
 
     def pending_count(self) -> int:
         return sum(len(u) for u in self.pending)
+
+    def meta_outstanding(self) -> int:
+        """Metadata files still to fetch, or fetched but not yet parsed."""
+        in_flight = sum(1 for j in self.jobs.values() if j.get("kind") == "metadata"
+                        for i in j["items"] if i["relpath"] not in self.done_set)
+        return (sum(len(u) for u in self.pending_meta) + in_flight
+                + len(self.to_expand))
+
+    def episodes_done(self) -> int:
+        return len(self.done_set) - self.meta_files_done - len(self.given_up)
 
     def mark_done(self, relpath: str, worker: Worker | None, nbytes: int, now: float,
                   count_rate: bool = True) -> bool:
         if relpath in self.done_set:
             return False
         self.done_set.add(relpath)
+        self.failures.pop(relpath, None)
+        if is_meta_relpath(relpath):
+            self.meta_files_done += 1
+            self.to_expand.append(relpath)  # the expander turns it into more work
         if count_rate:  # files found already on disk must not inflate the rate
             self.completions.append(now)
         while self.completions and now - self.completions[0] > RATE_WINDOW_SEC:
@@ -454,7 +518,35 @@ class State:
         return len(self.completions) * 60.0 / span
 
     def is_complete(self) -> bool:
-        return (self.phase == "episodes" and not self.pending and not self.jobs)
+        return (self.phase == "episodes" and not self.pending and not self.jobs
+                and not self.pending_meta and not self.to_expand)
+
+    def enqueue_meta(self, label: str, relpath_urls: list[tuple[str, str]],
+                     refresh: bool) -> None:
+        """Queue metadata files for the cluster. Files already on disk are parsed
+        straight away unless the race just went public, when they may be stale."""
+        fresh = []
+        for relpath, url in relpath_urls:
+            if relpath in self.done_set:
+                continue
+            self.meta_files_total += 1
+            path = race_dir(label) / relpath
+            if not refresh and exists_nonempty(path):
+                self.done_set.add(relpath)
+                self.meta_files_done += 1
+                self.to_expand.append(relpath)
+                continue
+            if refresh and path.exists():
+                # the copy on disk is from before the race was published and may
+                # list fewer episodes; drop it so the fetch really happens
+                try:
+                    path.unlink()
+                except OSError as err:
+                    self.note_event("warn", f"cannot refresh {relpath}: {err}")
+            fresh.append({"relpath": relpath, "url": url})
+        for i in range(0, len(fresh), UNIT_MAX_META):
+            self.pending_meta.append(fresh[i:i + UNIT_MAX_META])
+        self.cond.notify_all()
 
     def enqueue_episodes(self, label: str, relpath_urls: list[tuple[str, str]]) -> None:
         """Add one eval run's episodes, chunked, skipping files already on disk."""
@@ -480,7 +572,169 @@ STATE = State()
 # --------------------------------------------------------------------------- #
 # metadata fetch: race -> qualifiers -> runs -> eval runs -> episode queue
 # --------------------------------------------------------------------------- #
-def metadata_worker(race_id: str, label: str) -> None:
+def race_cancelled(generation: int) -> bool:
+    with STATE.cond:
+        return STATE.generation != generation
+
+
+def included_runs(raw_runs: bytes, race_id: str) -> list[dict]:
+    """The RACE runs of one agent that count for this race."""
+    try:
+        runs = json.loads(raw_runs)
+    except json.JSONDecodeError:
+        return []
+    return [r for r in runs
+            if str(r.get("race_id")) == race_id
+            and r.get("phase") == "RACE"
+            and r.get("is_included") is True
+            and r.get("status") != "STALE"]
+
+
+def episode_items(raw_detail: bytes, agent_id: str, eval_run_id: str) -> list[tuple[str, str]]:
+    try:
+        detail = json.loads(raw_detail)
+    except json.JSONDecodeError:
+        return []
+    items = (detail.get("items") or {}).get("items") or []
+    out = []
+    for item in items:
+        ep = item.get("episode_result_id")
+        if ep:
+            out.append((f"agents/{agent_id}/{eval_run_id}/episodes/{ep}.json",
+                        f"{API_BASE}/v1/public/episode-results/{ep}/feedback"))
+    return out
+
+
+def expand_meta_file(relpath: str, race_id: str, label: str, refresh: bool) -> None:
+    """Turn one downloaded metadata file into the next level of work."""
+    try:
+        raw = (race_dir(label) / relpath).read_bytes()
+    except OSError as err:
+        with STATE.cond:
+            STATE.note_event("warn", f"cannot read {relpath}: {err}")
+        return
+
+    parts = relpath.split("/")
+    if relpath.endswith("/runs.json"):          # agents/<agent>/runs.json
+        agent_id = parts[1]
+        runs = included_runs(raw, race_id)
+        nxt = [(f"agents/{agent_id}/{r['eval_run_id']}/evaluation_run.json",
+                f"{API_BASE}/v1/public/evaluation-runs/{r['eval_run_id']}")
+               for r in runs if r.get("eval_run_id")]
+        with STATE.cond:
+            STATE.meta["agents_done"] += 1
+            STATE.meta["runs_included"] += len(runs)
+            STATE.enqueue_meta(label, nxt, refresh)
+    elif relpath.endswith("/evaluation_run.json"):  # agents/<agent>/<run>/...
+        agent_id, eval_run_id = parts[1], parts[2]
+        episodes = episode_items(raw, agent_id, eval_run_id)
+        with STATE.cond:
+            STATE.meta["runs_saved"] += 1
+            STATE.meta["episodes_found"] += len(episodes)
+            STATE.enqueue_episodes(label, episodes)
+
+
+def expander() -> None:
+    """Parse metadata files as they arrive, from any machine in the cluster."""
+    while True:
+        with STATE.cond:
+            while not STATE.to_expand:
+                STATE.cond.wait(2.0)
+                if STATE.to_expand:
+                    break
+                update_phase()
+            relpath = STATE.to_expand.popleft()
+            race_id, label = STATE.race_id, STATE.label
+            refresh = STATE.meta.get("refresh", False)
+        if not race_id or not label:
+            continue
+        if relpath == "race.json":
+            continue  # the watcher handles the race file itself
+        try:
+            expand_meta_file(relpath, race_id, label, refresh)
+        except Exception as err:  # noqa: BLE001 - one bad file must not stop the rest
+            with STATE.cond:
+                STATE.note_event("warn", f"could not parse {relpath}: {err}")
+        with STATE.cond:
+            update_phase()
+
+
+def update_phase() -> None:
+    """Metadata first: episodes only start once nothing metadata is left.
+    Caller holds STATE.cond."""
+    if STATE.phase == "metadata" and STATE.meta_outstanding() == 0:
+        STATE.phase = "episodes"
+        STATE.note_event("metadata",
+                         f"metadata done: {STATE.meta['runs_saved']} runs, "
+                         f"{STATE.total_items} episodes "
+                         f"({STATE.preexisting} already on disk)")
+        STATE.meta["refresh"] = False
+        STATE.cond.notify_all()
+    note_complete_if_done(time.time())
+
+
+# --------------------------------------------------------------------------- #
+# waiting for a race to be published
+# --------------------------------------------------------------------------- #
+def probe_published(race_id: str, qualifiers: list[dict], limiter: "RateLimiter",
+                    on_429) -> tuple[bool, str]:
+    """Are the episode logs downloadable yet? Costs a handful of requests.
+
+    ORO publishes feedback some hours after a race ends; until then every
+    episode answers 404 ARTIFACT_NOT_FOUND. Several episodes are probed and one
+    success is enough, so a single genuinely missing artifact cannot keep the
+    race waiting for ever.
+    """
+    def fetch(path: str) -> bytes:
+        return oro_get(path, limiter, on_429=on_429)
+
+    probes: list[str] = []
+    note = "no included RACE runs with episodes yet"
+    try:
+        for qualifier in qualifiers:
+            agent_id = qualifier.get("agent_version_id")
+            if not agent_id or len(probes) >= PROBE_EPISODES:
+                break
+            runs = included_runs(fetch(f"/v1/public/agent-versions/{agent_id}/runs"),
+                                 race_id)
+            if not runs:
+                continue
+            eval_run_id = runs[0].get("eval_run_id")
+            if not eval_run_id:
+                continue
+            episodes = episode_items(
+                fetch(f"/v1/public/evaluation-runs/{eval_run_id}"), agent_id, eval_run_id)
+            # one episode per agent first; fall back to several from one agent
+            for _, url in episodes[:PROBE_EPISODES]:
+                probes.append(url[len(API_BASE):])
+                if len(qualifiers) > 1:
+                    break
+    except urllib.error.HTTPError as err:
+        return False, (f"metadata is not published yet ({err.code})" if err.code == 404
+                       else f"probe got HTTP {err.code}")
+    except Exception as err:  # noqa: BLE001
+        return False, f"probe failed: {err}"
+
+    for path in probes[:PROBE_EPISODES]:
+        try:
+            fetch(path)
+            return True, "episode logs are available"
+        except urllib.error.HTTPError as err:
+            if err.code != 404:
+                return False, f"probe got HTTP {err.code}"
+            note = "episode logs are not published yet (404)"
+        except Exception as err:  # noqa: BLE001
+            return False, f"probe failed: {err}"
+    return False, note
+
+
+def race_watcher(race_id: str, label: str, generation: int) -> None:
+    """Wait until the race is published, then queue the metadata for everyone.
+
+    The race file and the runs can change while a race is still being scored,
+    so once the logs appear every metadata file is fetched again instead of
+    trusting what is already on disk.
+    """
     limiter = STATE.limiter
 
     def on_429() -> None:
@@ -488,96 +742,67 @@ def metadata_worker(race_id: str, label: str) -> None:
             STATE.oro_429_total += 1
             STATE.metadata_429 += 1
 
-    def fetch(url: str) -> bytes:
-        return oro_get(url, limiter, on_429=on_429)
+    waited = False
+    while True:
+        if race_cancelled(generation):
+            return
+        try:
+            raw = oro_get(f"/v1/public/races/{race_id}", limiter, on_429=on_429)
+            write_atomic(race_dir(label) / "race.json", raw)
+            race = json.loads(raw)
+        except Exception as err:  # noqa: BLE001 - the race may not exist yet
+            note = f"cannot read the race yet: {err}"
+            qualifiers, status = [], None
+        else:
+            qualifiers = race.get("qualifiers") or []
+            status = (race.get("race") or {}).get("status")
+            note = ""
 
-    try:
-        base = race_dir(label)
-        base.mkdir(parents=True, exist_ok=True)
-        raw = fetch(f"/v1/public/races/{race_id}")
-        write_atomic(base / "race.json", raw)
-        race = json.loads(raw)
-        qualifiers = race.get("qualifiers") or []
-        agent_ids = []
-        for q in qualifiers:
-            av = q.get("agent_version_id")
-            if av and av not in agent_ids:
-                agent_ids.append(av)
-        with STATE.cond:
-            STATE.meta["agents_total"] = len(agent_ids)
-            STATE.note_event("metadata", f"race {race.get('race', {}).get('race_number')} "
-                                         f"has {len(agent_ids)} qualifiers")
-
-        for agent_id in agent_ids:
-            try:
-                raw_runs = fetch(f"/v1/public/agent-versions/{agent_id}/runs")
-            except Exception as err:  # noqa: BLE001 - keep going past one bad agent
-                with STATE.cond:
-                    STATE.note_event("warn", f"runs failed for {agent_id}: {err}")
-                    STATE.meta["agents_done"] += 1
-                continue
-            write_atomic(base / "agents" / agent_id / "runs.json", raw_runs)
-            try:
-                runs = json.loads(raw_runs)
-            except json.JSONDecodeError:
-                runs = []
-            included = [
-                r for r in runs
-                if str(r.get("race_id")) == race_id
-                and r.get("phase") == "RACE"
-                and r.get("is_included") is True
-                and r.get("status") != "STALE"
-            ]
-            with STATE.cond:
-                STATE.meta["runs_included"] += len(included)
-
-            for run in included:
-                eval_run_id = run.get("eval_run_id")
-                if not eval_run_id:
-                    continue
-                run_dir = base / "agents" / agent_id / eval_run_id
-                detail_path = run_dir / "evaluation_run.json"
-                try:
-                    if exists_nonempty(detail_path):
-                        raw_detail = detail_path.read_bytes()
-                    else:
-                        raw_detail = fetch(f"/v1/public/evaluation-runs/{eval_run_id}")
-                        write_atomic(detail_path, raw_detail)
-                    detail = json.loads(raw_detail)
-                except Exception as err:  # noqa: BLE001
-                    with STATE.cond:
-                        STATE.note_event("warn", f"eval run {eval_run_id} failed: {err}")
-                    continue
-
-                items = (detail.get("items") or {}).get("items") or []
-                episodes = []
-                for item in items:
-                    ep = item.get("episode_result_id")
-                    if not ep:
-                        continue
-                    episodes.append((
-                        f"agents/{agent_id}/{eval_run_id}/episodes/{ep}.json",
-                        f"{API_BASE}/v1/public/episode-results/{ep}/feedback",
-                    ))
-                with STATE.cond:
-                    STATE.meta["runs_saved"] += 1
-                    STATE.meta["episodes_found"] += len(episodes)
-                    STATE.enqueue_episodes(label, episodes)
-
-            with STATE.cond:
-                STATE.meta["agents_done"] += 1
+        ready = False
+        if note:
+            pass
+        elif WATCH_REQUIRE_COMPLETE and status != "RACE_COMPLETE":
+            note = f"race is {status}, waiting for it to finish"
+        elif not qualifiers:
+            note = "the race has no qualifiers yet"
+        else:
+            ready, note = probe_published(race_id, qualifiers, limiter, on_429)
 
         with STATE.cond:
-            STATE.phase = "episodes"
-            STATE.note_event("metadata", f"metadata done: {STATE.meta['runs_saved']} runs, "
-                                         f"{STATE.total_items} episodes "
-                                         f"({STATE.preexisting} already on disk)")
-            STATE.cond.notify_all()
-    except Exception as err:  # noqa: BLE001
-        with STATE.cond:
-            STATE.phase = "error"
-            STATE.note_event("error", f"metadata fetch failed: {err}")
-            STATE.cond.notify_all()
+            if STATE.generation != generation:
+                return
+            STATE.watch["checks"] += 1
+            STATE.watch["note"] = note
+            STATE.watch["last_check"] = time.time()
+            if ready:
+                STATE.phase = "metadata"
+                STATE.meta["agents_total"] = len(qualifiers)
+                STATE.meta["refresh"] = waited
+                STATE.note_event("metadata", f"race {(race.get('race') or {}).get('race_number')}"
+                                             f" has {len(qualifiers)} qualifiers"
+                                             + (" (metadata re-fetched after waiting)"
+                                                if waited else ""))
+                agent_ids, seen = [], set()
+                for qualifier in qualifiers:
+                    agent_id = qualifier.get("agent_version_id")
+                    if agent_id and agent_id not in seen:
+                        seen.add(agent_id)
+                        agent_ids.append(agent_id)
+                STATE.enqueue_meta(
+                    label,
+                    [(f"agents/{a}/runs.json",
+                      f"{API_BASE}/v1/public/agent-versions/{a}/runs") for a in agent_ids],
+                    refresh=waited)
+                STATE.cond.notify_all()
+                return
+            if STATE.watch["checks"] == 1 or STATE.watch["checks"] % 10 == 0:
+                STATE.note_event("waiting", f"{note}; checking again every "
+                                            f"{WATCH_INTERVAL_SEC:.0f}s")
+        waited = True
+        for _ in range(int(max(WATCH_INTERVAL_SEC, 1))):
+            if race_cancelled(generation):
+                return
+            time.sleep(1)
 
 
 def start_race(race_id: str, label: str | None) -> dict:
@@ -597,13 +822,21 @@ def start_race(race_id: str, label: str | None) -> dict:
     race_dir(label)  # validates
 
     with STATE.cond:
+        STATE.generation += 1
         STATE.race_id = race_id
         STATE.label = label
-        STATE.phase = "metadata"
+        STATE.phase = "waiting"  # the watcher moves it on when the logs exist
         STATE.started_at = time.time()
         STATE.finished_at = None
         STATE.meta = {"agents_total": 0, "agents_done": 0, "runs_included": 0,
-                      "runs_saved": 0, "episodes_found": 0}
+                      "runs_saved": 0, "episodes_found": 0, "refresh": False}
+        STATE.watch = {"checks": 0, "note": "starting", "last_check": 0.0}
+        STATE.pending_meta.clear()
+        STATE.to_expand.clear()
+        STATE.meta_files_total = 0
+        STATE.meta_files_done = 0
+        STATE.failures.clear()
+        STATE.given_up.clear()
         STATE.pending.clear()
         STATE.jobs.clear()
         STATE.done_set.clear()
@@ -622,11 +855,53 @@ def start_race(race_id: str, label: str | None) -> dict:
             worker.oro_429 = 0
             worker.completions.clear()
         STATE.note_event("race", f"start {race_id} -> {label}")
-        thread = threading.Thread(target=metadata_worker, args=(race_id, label),
-                                  daemon=True, name="metadata")
+        save_race_state(race_id, label, complete=False)
+        thread = threading.Thread(target=race_watcher,
+                                  args=(race_id, label, STATE.generation),
+                                  daemon=True, name="watcher")
         STATE.meta_thread = thread
         thread.start()
         return {"race_id": race_id, "label": label, "phase": STATE.phase}
+
+
+def stop_race() -> dict:
+    """Give up on the current race. Everything downloaded stays on disk, and a
+    restart will not pick it up again; starting the same race resumes it."""
+    with STATE.cond:
+        race_id, label = STATE.race_id, STATE.label
+        if not race_id or STATE.phase in ("idle", "stopped"):
+            return {"stopped": False, "reason": "no race is running"}
+        STATE.generation += 1  # the watcher thread, if any, stops on its own
+        STATE.pending.clear()
+        STATE.pending_meta.clear()
+        STATE.to_expand.clear()
+        STATE.jobs.clear()  # workers are told to abandon on their next report
+        STATE.phase = "stopped"
+        STATE.finished_at = time.time()
+        for worker in STATE.workers.values():
+            worker.job_id = None
+            worker.in_flight = 0
+        kept = len(STATE.done_set)
+        STATE.note_event("race", f"stopped {race_id} ({label}); {kept} files kept")
+        save_race_state(race_id, label, complete=True)
+        STATE.cond.notify_all()
+    log(f"race stopped by request; {kept} files kept under label {label}")
+    return {"stopped": True, "race_id": race_id, "label": label, "files_kept": kept}
+
+
+def resume_saved_race() -> None:
+    """Continue the race that was running before this process started."""
+    saved = load_race_state() or {}
+    if saved.get("complete") or not saved.get("race_id"):
+        return
+    time.sleep(1.0)  # let the listener come up, so workers can reconnect at once
+    try:
+        start_race(saved["race_id"], saved.get("label") or None)
+    except Exception as err:  # noqa: BLE001 - never take the server down for this
+        log(f"could not resume the saved race: {err}")
+        return
+    log(f"resumed race {saved['race_id']} -> {saved.get('label')}; "
+        "files already on disk are skipped")
 
 
 def resolve_label(race_id: str) -> str:
@@ -649,7 +924,7 @@ def steal_tail(worker: Worker) -> None:
     """
     victim, remaining = None, []
     for job in STATE.jobs.values():
-        if job["worker_id"] == worker.worker_id:
+        if job["worker_id"] == worker.worker_id or job.get("kind") == "metadata":
             continue
         rem = [i for i in job["items"] if i["relpath"] not in STATE.done_set]
         if len(rem) > len(remaining):
@@ -668,14 +943,25 @@ def steal_tail(worker: Worker) -> None:
 
 
 def take_unit(worker: Worker) -> dict | None:
-    """Hand out ONE small unit. Caller holds STATE.cond."""
+    """Hand out ONE small unit, metadata before episodes. Caller holds cond."""
     label = STATE.label
     if not label:
         return None
+    if STATE.pending_meta:
+        return take_from(worker, STATE.pending_meta, "metadata", label)
+    # everyone waits for the episode list, so do not start episodes while
+    # metadata is still being fetched or parsed
+    if STATE.meta_outstanding():
+        return None
     if not STATE.pending:
         steal_tail(worker)
-    while STATE.pending:
-        unit = STATE.pending.popleft()
+    return take_from(worker, STATE.pending, "episodes", label)
+
+
+def take_from(worker: Worker, queue: "collections.deque[list[dict]]", kind: str,
+              label: str) -> dict | None:
+    while queue:
+        unit = queue.popleft()
         items = []
         for item in unit:
             if item["relpath"] in STATE.done_set:
@@ -692,13 +978,31 @@ def take_unit(worker: Worker) -> dict | None:
         STATE.jobs[job_id] = {
             "job_id": job_id, "worker_id": worker.worker_id, "items": items,
             "started": now, "last_progress": now, "label": label,
-            "race_id": STATE.race_id,
+            "race_id": STATE.race_id, "kind": kind,
         }
         worker.job_id = job_id
         worker.in_flight = len(items)
         return {"job_id": job_id, "race_id": STATE.race_id, "label": label,
-                "items": items}
+                "kind": kind, "items": items}
     return None
+
+
+def note_failures(relpaths: list[str]) -> None:
+    """Stop chasing a file the API will not give us. Caller holds STATE.cond."""
+    for relpath in relpaths:
+        if relpath in STATE.done_set:
+            continue
+        STATE.failures[relpath] = STATE.failures.get(relpath, 0) + 1
+        if STATE.failures[relpath] < MAX_ITEM_FAILURES:
+            continue
+        # counts as resolved so the race can finish; reported separately
+        STATE.given_up.add(relpath)
+        STATE.done_set.add(relpath)
+        if is_meta_relpath(relpath):
+            STATE.meta_files_done += 1
+        if len(STATE.given_up) in (1, 10, 100) or len(STATE.given_up) % 500 == 0:
+            STATE.note_event("warn", f"gave up on {len(STATE.given_up)} file(s) after "
+                                     f"{MAX_ITEM_FAILURES} attempts, e.g. {relpath}")
 
 
 def finish_job(job_id: str, keep_remaining: bool) -> None:
@@ -712,12 +1016,22 @@ def finish_job(job_id: str, keep_remaining: bool) -> None:
         worker.in_flight = 0
     remaining = [i for i in job["items"] if i["relpath"] not in STATE.done_set]
     if keep_remaining and remaining:
-        STATE.pending.appendleft(remaining)
+        if job.get("kind") == "metadata":
+            STATE.pending_meta.appendleft(remaining)
+        else:
+            STATE.pending.appendleft(remaining)
         STATE.cond.notify_all()
-    if STATE.is_complete() and STATE.finished_at is None:
-        STATE.finished_at = time.time()
-        STATE.note_event("race", f"race complete: {len(STATE.done_set)} files in "
-                                 f"{race_dir(STATE.label or '')}")
+    update_phase()
+
+
+def note_complete_if_done(now: float) -> None:
+    """Close out a finished race exactly once. Caller holds STATE.cond."""
+    if not STATE.is_complete() or STATE.finished_at is not None:
+        return
+    STATE.finished_at = now
+    STATE.note_event("race", f"race complete: {len(STATE.done_set)} files in "
+                             f"{race_dir(STATE.label or '')}")
+    save_race_state(STATE.race_id, STATE.label, complete=True)
 
 
 def watchdog() -> None:
@@ -735,8 +1049,7 @@ def watchdog() -> None:
                 finish_job(job["job_id"], keep_remaining=True)
             for worker in STATE.workers.values():
                 worker.trim(now)
-            if STATE.is_complete() and STATE.finished_at is None:
-                STATE.finished_at = now
+            update_phase()
 
 
 # --------------------------------------------------------------------------- #
@@ -745,7 +1058,7 @@ def watchdog() -> None:
 def status_payload() -> dict:
     now = time.time()
     with STATE.cond:
-        done = len(STATE.done_set)
+        done = STATE.episodes_done()
         pending = STATE.pending_count()
         in_flight = STATE.in_flight_count()
         total = max(STATE.total_items, done + pending + in_flight)
@@ -774,7 +1087,12 @@ def status_payload() -> dict:
             "complete": STATE.is_complete(),
             "started_at": STATE.started_at,
             "finished_at": STATE.finished_at,
-            "metadata": dict(STATE.meta, oro_429=STATE.metadata_429),
+            "metadata": dict(STATE.meta, oro_429=STATE.metadata_429,
+                             files_total=STATE.meta_files_total,
+                             files_done=STATE.meta_files_done,
+                             outstanding=STATE.meta_outstanding()),
+            "watch": dict(STATE.watch, interval=WATCH_INTERVAL_SEC),
+            "given_up": len(STATE.given_up),
             "totals": {
                 "done": done,
                 "preexisting": STATE.preexisting,
@@ -815,22 +1133,25 @@ NO_DIST_PAGE = (b"<h1>oro-main</h1><p>API is up. The React build is missing - ru
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "oro-main/1.0"
+    # a worker that freezes mid-upload must not hold a thread for ever; long
+    # polls wait on a condition variable, not on the socket, so this is safe
+    timeout = 120
 
     # -- plumbing ---------------------------------------------------------- #
     def log_message(self, fmt, *args):  # quieter pm2 logs
         pass
 
     def _send(self, code: int, body: bytes, ctype: str = "application/json") -> None:
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        if self.command != "HEAD":
-            try:
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            if self.command != "HEAD":
                 self.wfile.write(body)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True  # peer went away mid-reply
 
     def _json(self, code: int, obj) -> None:
         self._send(code, json.dumps(obj).encode(), "application/json")
@@ -911,6 +1232,9 @@ class Handler(BaseHTTPRequestHandler):
                 break
             chunks.append(chunk)
             remaining -= len(chunk)
+        # the peer can vanish mid-request, so callers that persist a body must
+        # not mistake what arrived for the whole of it
+        self.body_truncated = remaining > 0
         return b"".join(chunks)
 
     def _worker(self, worker_id: str) -> Worker:
@@ -966,6 +1290,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(502, {"error": f"could not start: {err}"})
             return self._json(200, result)
 
+        if path == "/api/races/stop":
+            if not self._ui_gate(mutating=True):
+                return
+            return self._json(200, stop_race())
+
         parts = path.strip("/").split("/")
         if len(parts) == 4 and parts[0] == "api" and parts[1] == "work":
             if not self._worker_gate():
@@ -991,6 +1320,12 @@ class Handler(BaseHTTPRequestHandler):
         body = self._body()
         if not body:
             return self._json(400, {"error": "empty body"})
+        if self.body_truncated:
+            # Writing a half-received file is worse than not writing it: resume
+            # skips anything with size > 0, so it would never be fetched again.
+            # The worker retries the upload by itself.
+            self.close_connection = True
+            return self._json(400, {"error": "truncated upload, not written"})
 
         created = True
         if exists_nonempty(dest):
@@ -1079,6 +1414,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 STATE.note_event("fail", f"{worker_id} failed job {job_id}: "
                                          f"{payload.get('error', 'unknown')}")
+                note_failures(payload.get("failed_relpaths") or [])
                 finish_job(job_id, keep_remaining=True)
             return self._json(200, {"ok": True})
 
@@ -1140,6 +1476,7 @@ class Server(ThreadingHTTPServer):
 def cmd_serve(_args) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     threading.Thread(target=watchdog, daemon=True, name="watchdog").start()
+    threading.Thread(target=expander, daemon=True, name="expander").start()
     server = Server((BIND_HOST, BIND_PORT), Handler)
     worker_gates = []
     if ALLOW_NETS:
@@ -1176,6 +1513,14 @@ def cmd_serve(_args) -> None:
     if TRUST_PROXY:
         log("TRUST_PROXY=1: the last X-Forwarded-For entry from a loopback/private "
             "peer is treated as the client IP")
+    saved = load_race_state() or {}
+    if saved.get("race_id") and not saved.get("complete"):
+        if AUTO_RESUME:
+            threading.Thread(target=resume_saved_race, daemon=True,
+                             name="resume").start()
+        else:
+            log(f"AUTO_RESUME=0: race {saved['race_id']} was interrupted; "
+                "start it again to continue where it stopped")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -1189,6 +1534,12 @@ def cmd_start(args) -> None:
     sys.exit(0 if code == 200 else 1)
 
 
+def cmd_stop(_args) -> None:
+    code, body = api_call("POST", "/api/races/stop")
+    print(json.dumps(body, indent=2))
+    sys.exit(0 if code == 200 else 1)
+
+
 def cmd_status(_args) -> None:
     code, s = api_call("GET", "/api/status")
     if code != 200:
@@ -1198,14 +1549,20 @@ def cmd_status(_args) -> None:
     eta = f"{r['eta_seconds'] // 60}m{r['eta_seconds'] % 60:02d}s" if r["eta_seconds"] else "-"
     print(f"race   : {s['race_id']}  label={s['label']}  phase={s['phase']}"
           f"{'  COMPLETE' if s['complete'] else ''}")
+    if s["phase"] == "waiting":
+        w = s.get("watch") or {}
+        print(f"waiting: {w.get('note', '')}  (checked {w.get('checks', 0)}x, "
+              f"every {w.get('interval', 0):.0f}s)")
     m = s["metadata"]
-    print(f"meta   : agents {m['agents_done']}/{m['agents_total']}  "
+    print(f"meta   : files {m.get('files_done', 0)}/{m.get('files_total', 0)}  "
+          f"agents {m['agents_done']}/{m['agents_total']}  "
           f"runs {m['runs_saved']}/{m['runs_included']}  episodes {m['episodes_found']}")
     print(f"files  : done {t['done']}/{t['total']} ({t['percent']}%)  "
           f"pending {t['pending']}  in-flight {t['in_flight']}  "
           f"pre-existing {t['preexisting']}")
     print(f"rate   : {r['files_per_min']} files/min  eta {eta}  "
-          f"429s {s['oro_429_total']}  requeues {s['requeues']}  steals {s['steals']}")
+          f"429s {s['oro_429_total']}  requeues {s['requeues']}  steals {s['steals']}"
+          + (f"  unavailable {s['given_up']}" if s.get("given_up") else ""))
     print(f"{'worker':<22}{'status':<13}{'done':>7}{'units':>7}{'flight':>7}"
           f"{'epm':>8}{'429':>5}{'MB':>9}{'seen':>7}")
     for w in s["workers"]:
@@ -1223,6 +1580,8 @@ def main() -> None:
     start.add_argument("--race-id", required=True)
     start.add_argument("--label", default=None, help="default: race<race_number>")
     start.set_defaults(func=cmd_start)
+    sub.add_parser("stop", help="stop the running race, keeping downloaded files") \
+        .set_defaults(func=cmd_stop)
     sub.add_parser("status", help="print cluster status").set_defaults(func=cmd_status)
     args = parser.parse_args()
     socket.setdefaulttimeout(None)
