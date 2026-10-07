@@ -21,6 +21,7 @@ import json
 import os
 import re
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -81,6 +82,24 @@ DATA_DIR = Path(os.environ.get("DATA_DIR") or (ROOT / "Data" / "races")).resolve
 STATE_FILE = Path(os.environ.get("STATE_FILE") or (ROOT / ".oro-main-state.json"))
 AUTO_RESUME = os.environ.get("AUTO_RESUME", "1").strip() not in ("0", "false", "no")
 DIST_DIR = Path(os.environ.get("DIST_DIR") or (ROOT / "frontend" / "dist")).resolve()
+# After a race download finishes, rebuild task_dictionary.json from the race
+# logs (used by oro_local_store). Set UPDATE_TASK_DICTIONARY=0 to disable.
+UPDATE_TASK_DICTIONARY = os.environ.get("UPDATE_TASK_DICTIONARY", "1").strip() \
+    not in ("0", "false", "no")
+TASK_DICTIONARY_SCRIPT = Path(os.environ.get(
+    "TASK_DICTIONARY_SCRIPT",
+    "/home/new_oro/ORO_LOGS/build_task_dictionary.py",
+)).expanduser().resolve()
+TASK_DICTIONARY_TIMEOUT_SEC = float(os.environ.get("TASK_DICTIONARY_TIMEOUT_SEC", "600"))
+# After rebuild, commit + push the new race (and task_dictionary.json) in the
+# ORO_LOGS git repo. Message: "add: Race <n>". Set PUSH_ORO_LOGS=0 to disable.
+PUSH_ORO_LOGS = os.environ.get("PUSH_ORO_LOGS", "1").strip() not in ("0", "false", "no")
+ORO_LOGS_GIT_DIR = Path(os.environ.get(
+    "ORO_LOGS_GIT_DIR",
+    str(TASK_DICTIONARY_SCRIPT.parent),
+)).expanduser().resolve()
+ORO_LOGS_GIT_TIMEOUT_SEC = float(os.environ.get("ORO_LOGS_GIT_TIMEOUT_SEC", "3600"))
+_task_dict_lock = threading.Lock()
 
 # main's metadata fetch shares its public IP with main's local worker, so it
 # takes half of the ~98/min budget by default
@@ -1024,14 +1043,201 @@ def finish_job(job_id: str, keep_remaining: bool) -> None:
     update_phase()
 
 
+def race_number_label(label: str | None) -> str | None:
+    """Turn 'race6' / race.json into the number used in 'add: Race N'."""
+    if label:
+        match = re.fullmatch(r"race(\d+)", label.strip(), re.I)
+        if match:
+            return match.group(1)
+        try:
+            raw = (race_dir(label) / "race.json").read_bytes()
+            number = (json.loads(raw).get("race") or {}).get("race_number")
+            if number is not None:
+                return str(number)
+        except (OSError, UnsafePath, json.JSONDecodeError, TypeError):
+            pass
+    return None
+
+
+def _git_run(args: list[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(ORO_LOGS_GIT_DIR), *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def ensure_oro_logs_ssh_remote() -> None:
+    """Prefer SSH for origin: HTTPS has no stored credentials on this host."""
+    proc = _git_run(["remote", "get-url", "origin"], timeout=30)
+    if proc.returncode != 0:
+        return
+    url = (proc.stdout or "").strip()
+    if url.startswith("https://github.com/"):
+        ssh_url = "git@" + url[len("https://"):].replace("/", ":", 1)
+        if ssh_url.endswith(".git") or "/" in ssh_url:
+            _git_run(["remote", "set-url", "origin", ssh_url], timeout=30)
+
+
+def push_oro_logs(label: str | None) -> None:
+    """git add / commit / push the finished race under ORO_LOGS."""
+    if not PUSH_ORO_LOGS:
+        return
+    if not (ORO_LOGS_GIT_DIR / ".git").exists():
+        with STATE.cond:
+            STATE.note_event(
+                "warn",
+                f"ORO_LOGS git push skipped: not a repo ({ORO_LOGS_GIT_DIR})",
+            )
+        return
+    number = race_number_label(label)
+    if not number:
+        with STATE.cond:
+            STATE.note_event(
+                "warn",
+                f"ORO_LOGS git push skipped: cannot read race number from {label!r}",
+            )
+        return
+    message = f"add: Race {number}"
+    with STATE.cond:
+        STATE.note_event("race", f"git commit/push ORO_LOGS ({message})")
+    try:
+        ensure_oro_logs_ssh_remote()
+        paths = ["task_dictionary.json", "build_task_dictionary.py", ".gitignore"]
+        if label and SAFE_SEGMENT.match(label):
+            paths.append(f"races/{label}")
+        add = _git_run(
+            ["add", "--", *[p for p in paths if (ORO_LOGS_GIT_DIR / p).exists()
+                            or p.startswith("races/")]],
+            timeout=ORO_LOGS_GIT_TIMEOUT_SEC,
+        )
+        if add.returncode != 0:
+            err = (add.stderr or add.stdout or "git add failed").strip()
+            with STATE.cond:
+                STATE.note_event("warn", f"ORO_LOGS git add failed: {err[:240]}")
+            return
+        staged = _git_run(["diff", "--cached", "--quiet"], timeout=60)
+        if staged.returncode == 0:
+            with STATE.cond:
+                STATE.note_event("race", "ORO_LOGS git: nothing new to commit")
+            return
+        commit = _git_run(
+            ["commit", "-m", message],
+            timeout=ORO_LOGS_GIT_TIMEOUT_SEC,
+        )
+        if commit.returncode != 0:
+            err = (commit.stderr or commit.stdout or "git commit failed").strip()
+            with STATE.cond:
+                STATE.note_event("warn", f"ORO_LOGS git commit failed: {err[:240]}")
+            return
+        push = _git_run(["push", "origin", "HEAD"], timeout=ORO_LOGS_GIT_TIMEOUT_SEC)
+        if push.returncode != 0:
+            err = (push.stderr or push.stdout or "git push failed").strip()
+            with STATE.cond:
+                STATE.note_event("warn", f"ORO_LOGS git push failed: {err[:240]}")
+            return
+        with STATE.cond:
+            STATE.note_event("race", f"ORO_LOGS pushed: {message}")
+    except subprocess.TimeoutExpired:
+        with STATE.cond:
+            STATE.note_event(
+                "warn",
+                f"ORO_LOGS git timed out after {ORO_LOGS_GIT_TIMEOUT_SEC:.0f}s",
+            )
+    except OSError as err:
+        with STATE.cond:
+            STATE.note_event("warn", f"ORO_LOGS git failed: {err}")
+
+
+def refresh_task_dictionary(label: str | None) -> None:
+    """Rebuild task_dictionary.json from downloaded race logs (background)."""
+    if not _task_dict_lock.acquire(blocking=False):
+        log("task-dictionary: refresh already running, skip")
+        return
+    try:
+        if not TASK_DICTIONARY_SCRIPT.is_file():
+            msg = f"task dictionary refresh skipped: missing {TASK_DICTIONARY_SCRIPT}"
+            with STATE.cond:
+                STATE.note_event("warn", msg)
+            return
+        with STATE.cond:
+            STATE.note_event(
+                "race",
+                "updating task_dictionary.json"
+                + (f" after {label}" if label else ""),
+            )
+        started = time.time()
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(TASK_DICTIONARY_SCRIPT)],
+                capture_output=True,
+                text=True,
+                timeout=TASK_DICTIONARY_TIMEOUT_SEC,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            with STATE.cond:
+                STATE.note_event(
+                    "warn",
+                    f"task dictionary refresh timed out after "
+                    f"{TASK_DICTIONARY_TIMEOUT_SEC:.0f}s",
+                )
+            return
+        except OSError as err:
+            with STATE.cond:
+                STATE.note_event("warn", f"task dictionary refresh failed: {err}")
+            return
+        elapsed = time.time() - started
+        if proc.returncode != 0:
+            err = (proc.stderr or proc.stdout or "unknown error").strip()
+            with STATE.cond:
+                STATE.note_event(
+                    "warn",
+                    f"task dictionary refresh failed ({elapsed:.0f}s): {err[:240]}",
+                )
+            return
+        summary = ""
+        try:
+            data = json.loads(proc.stdout or "")
+            if isinstance(data, dict) and "tasks" in data:
+                summary = (f": {data['tasks']} tasks, "
+                           f"{data.get('correct_episodes_used', '?')} "
+                           f"correct episodes")
+        except json.JSONDecodeError:
+            pass
+        with STATE.cond:
+            STATE.note_event(
+                "race",
+                f"task dictionary updated in {elapsed:.0f}s{summary}",
+            )
+        push_oro_logs(label)
+    finally:
+        _task_dict_lock.release()
+
+
+def schedule_task_dictionary_refresh(label: str | None) -> None:
+    if not UPDATE_TASK_DICTIONARY:
+        return
+    threading.Thread(
+        target=refresh_task_dictionary,
+        args=(label,),
+        daemon=True,
+        name="task-dictionary",
+    ).start()
+
+
 def note_complete_if_done(now: float) -> None:
     """Close out a finished race exactly once. Caller holds STATE.cond."""
     if not STATE.is_complete() or STATE.finished_at is not None:
         return
     STATE.finished_at = now
+    label = STATE.label
     STATE.note_event("race", f"race complete: {len(STATE.done_set)} files in "
-                             f"{race_dir(STATE.label or '')}")
-    save_race_state(STATE.race_id, STATE.label, complete=True)
+                             f"{race_dir(label or '')}")
+    save_race_state(STATE.race_id, label, complete=True)
+    schedule_task_dictionary_refresh(label)
 
 
 def watchdog() -> None:
