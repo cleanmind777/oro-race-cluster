@@ -353,6 +353,16 @@ export default function App() {
       {status && <Totals status={status} />}
       {status && <WorkerTable status={status} />}
       {status && <Events status={status} />}
+      <p className="flaticon-credit">
+        <a
+          href="https://www.flaticon.com/free-icons/quadrant"
+          title="quadrant icons"
+          target="_blank"
+          rel="noreferrer"
+        >
+          Quadrant icons created by Jagat Icon - Flaticon
+        </a>
+      </p>
     </div>
   );
 }
