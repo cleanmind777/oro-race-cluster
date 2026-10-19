@@ -12,6 +12,7 @@ Env: MAIN_URL, CLUSTER_TOKEN, WORKER_ID, WRITE_LOCAL, DATA_DIR, WORKER_THREADS
 from __future__ import annotations
 
 import collections
+import gzip
 import json
 import os
 import platform
@@ -182,16 +183,30 @@ def main_request(method: str, path: str, data: bytes | None = None,
         return resp.status, body
 
 
+def read_http_body(resp) -> bytes:
+    """Return the decoded body. Episode feedback now requires gzip or Brotli."""
+    raw = resp.read()
+    encoding = (resp.headers.get("Content-Encoding") or "").lower()
+    if "gzip" in encoding or raw[:2] == b"\x1f\x8b":
+        return gzip.decompress(raw)
+    return raw
+
+
 def oro_get(url: str, attempts: int = 8, timeout: float = 120.0) -> bytes:
     last_err: Exception | None = None
     for attempt in range(attempts):
         LIMITER.acquire()
         req = urllib.request.Request(
-            url, headers={"Accept": "application/json", "User-Agent": USER_AGENT}
+            url,
+            headers={
+                "Accept": "application/json",
+                "Accept-Encoding": "gzip",
+                "User-Agent": USER_AGENT,
+            },
         )
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return resp.read()
+                return read_http_body(resp)
         except urllib.error.HTTPError as err:
             err.read()
             if err.code == 429:

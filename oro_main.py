@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import base64
 import collections
+import gzip
 import hmac
 import ipaddress
 import json
@@ -174,6 +175,15 @@ def parse_retry_after(value: str | None) -> float:
         return 60.0
 
 
+def read_http_body(resp) -> bytes:
+    """Return the decoded body. Episode feedback now requires gzip or Brotli."""
+    raw = resp.read()
+    encoding = (resp.headers.get("Content-Encoding") or "").lower()
+    if "gzip" in encoding or raw[:2] == b"\x1f\x8b":
+        return gzip.decompress(raw)
+    return raw
+
+
 def oro_get(url: str, limiter: RateLimiter, on_429=None, attempts: int = 6,
             timeout: float = 120.0) -> bytes:
     """GET raw bytes from the ORO public API through the limiter."""
@@ -183,11 +193,16 @@ def oro_get(url: str, limiter: RateLimiter, on_429=None, attempts: int = 6,
     for attempt in range(attempts):
         limiter.acquire()
         req = urllib.request.Request(
-            url, headers={"Accept": "application/json", "User-Agent": USER_AGENT}
+            url,
+            headers={
+                "Accept": "application/json",
+                "Accept-Encoding": "gzip",
+                "User-Agent": USER_AGENT,
+            },
         )
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return resp.read()
+                return read_http_body(resp)
         except urllib.error.HTTPError as err:
             err.read()
             if err.code == 429:
