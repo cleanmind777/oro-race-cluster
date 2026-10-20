@@ -93,13 +93,20 @@ TASK_DICTIONARY_SCRIPT = Path(os.environ.get(
 )).expanduser().resolve()
 TASK_DICTIONARY_TIMEOUT_SEC = float(os.environ.get("TASK_DICTIONARY_TIMEOUT_SEC", "600"))
 # After rebuild, commit + push the new race (and task_dictionary.json) in the
-# ORO_LOGS git repo. Message: "add: Race <n>". Set PUSH_ORO_LOGS=0 to disable.
+# ORO_LOGS git repo in ~10% batches (capped) so GitHub accepts each push.
+# Message: "add: Race <n> (i/total)". Set PUSH_ORO_LOGS=0 to disable.
 PUSH_ORO_LOGS = os.environ.get("PUSH_ORO_LOGS", "1").strip() not in ("0", "false", "no")
 ORO_LOGS_GIT_DIR = Path(os.environ.get(
     "ORO_LOGS_GIT_DIR",
     str(TASK_DICTIONARY_SCRIPT.parent),
 )).expanduser().resolve()
 ORO_LOGS_GIT_TIMEOUT_SEC = float(os.environ.get("ORO_LOGS_GIT_TIMEOUT_SEC", "3600"))
+ORO_LOGS_GIT_BATCH_FRAC = float(os.environ.get("ORO_LOGS_GIT_BATCH_FRAC", "0.10"))
+ORO_LOGS_GIT_BATCH_MAX_BYTES = int(os.environ.get(
+    "ORO_LOGS_GIT_BATCH_MAX_BYTES",
+    str(int(0.9 * 1024 ** 3)),
+))
+ORO_LOGS_GIT_PUSH_ATTEMPTS = int(os.environ.get("ORO_LOGS_GIT_PUSH_ATTEMPTS", "7"))
 _task_dict_lock = threading.Lock()
 
 # main's metadata fetch shares its public IP with main's local worker, so it
@@ -1096,8 +1103,156 @@ def ensure_oro_logs_ssh_remote() -> None:
             _git_run(["remote", "set-url", "origin", ssh_url], timeout=30)
 
 
+def _path_size(path: Path) -> int:
+    total = 0
+    try:
+        if path.is_file():
+            return path.stat().st_size
+        if not path.is_dir():
+            return 0
+        for child in path.rglob("*"):
+            if child.is_file():
+                try:
+                    total += child.stat().st_size
+                except OSError:
+                    pass
+    except OSError:
+        return 0
+    return total
+
+
+def _wait_for_git_index(timeout_s: float = 120.0) -> None:
+    lock = ORO_LOGS_GIT_DIR / ".git" / "index.lock"
+    started = time.time()
+    while lock.exists():
+        if time.time() - started > timeout_s:
+            try:
+                lock.unlink()
+            except OSError:
+                pass
+            return
+        time.sleep(1)
+
+
+def _git_add_paths(paths: list[str]) -> str | None:
+    """Stage paths in small groups. Returns an error message or None."""
+    chunk = 50
+    for i in range(0, len(paths), chunk):
+        _wait_for_git_index()
+        add = _git_run(
+            ["add", "--", *paths[i:i + chunk]],
+            timeout=ORO_LOGS_GIT_TIMEOUT_SEC,
+        )
+        if add.returncode != 0:
+            return (add.stderr or add.stdout or "git add failed").strip()
+    return None
+
+
+def _git_commit_and_push(message: str) -> str | None:
+    """Commit staged files and push with retries. Returns error or None."""
+    _wait_for_git_index()
+    staged = _git_run(["diff", "--cached", "--quiet"], timeout=60)
+    if staged.returncode == 0:
+        return None  # nothing staged
+
+    for commit_attempt in range(1, 6):
+        _wait_for_git_index()
+        commit = _git_run(
+            ["commit", "-m", message],
+            timeout=ORO_LOGS_GIT_TIMEOUT_SEC,
+        )
+        if commit.returncode == 0:
+            break
+        err = (commit.stderr or commit.stdout or "git commit failed").strip()
+        if "index.lock" in err and commit_attempt < 5:
+            time.sleep(2)
+            continue
+        return f"git commit failed: {err[:240]}"
+    else:
+        return "git commit failed after retries"
+
+    attempts = max(1, ORO_LOGS_GIT_PUSH_ATTEMPTS)
+    for attempt in range(1, attempts + 1):
+        with STATE.cond:
+            STATE.note_event(
+                "race",
+                f"ORO_LOGS git push attempt {attempt}/{attempts}: {message}",
+            )
+        push = _git_run(
+            ["push", "origin", "HEAD"],
+            timeout=ORO_LOGS_GIT_TIMEOUT_SEC,
+        )
+        if push.returncode == 0:
+            with STATE.cond:
+                STATE.note_event("race", f"ORO_LOGS pushed: {message}")
+            return None
+        err = (push.stderr or push.stdout or "git push failed").strip()
+        with STATE.cond:
+            STATE.note_event(
+                "warn",
+                f"ORO_LOGS git push failed ({attempt}/{attempts}): {err[:240]}",
+            )
+        if attempt < attempts:
+            time.sleep(45 * attempt)
+    return f"git push failed after {attempts} attempts: {message}"
+
+
+def _race_push_batches(label: str) -> tuple[list[list[str]], int]:
+    """Split races/<label> into agent batches (~frac of race, capped)."""
+    race_root = ORO_LOGS_GIT_DIR / "races" / label
+    if not race_root.is_dir():
+        return [], 0
+
+    top_files = sorted(
+        str(p.relative_to(ORO_LOGS_GIT_DIR))
+        for p in race_root.iterdir()
+        if p.is_file()
+    )
+    agents_root = race_root / "agents"
+    agent_dirs = sorted(p for p in agents_root.iterdir() if p.is_dir()) \
+        if agents_root.is_dir() else []
+
+    agent_sizes = [(str(p.relative_to(ORO_LOGS_GIT_DIR)), _path_size(p))
+                   for p in agent_dirs]
+    top_size = sum(_path_size(ORO_LOGS_GIT_DIR / p) for p in top_files)
+    total_size = top_size + sum(size for _, size in agent_sizes)
+
+    # Prefer the smaller of frac-target and hard cap so each push stays safe.
+    cap = max(ORO_LOGS_GIT_BATCH_MAX_BYTES, 1)
+    if total_size:
+        frac_target = max(int(total_size * max(ORO_LOGS_GIT_BATCH_FRAC, 0.01)), 1)
+        limit = min(cap, frac_target)
+    else:
+        limit = cap
+
+    batches: list[list[str]] = []
+    current: list[str] = []
+    current_size = 0
+
+    def flush() -> None:
+        nonlocal current, current_size
+        if current:
+            batches.append(current)
+            current = []
+            current_size = 0
+
+    if top_files:
+        current.extend(top_files)
+        current_size += top_size
+
+    for rel, size in agent_sizes:
+        if current and current_size + size > limit:
+            flush()
+        current.append(rel)
+        current_size += size
+        if current_size >= limit:
+            flush()
+    flush()
+    return batches, total_size
+
+
 def push_oro_logs(label: str | None) -> None:
-    """git add / commit / push the finished race under ORO_LOGS."""
+    """Commit/push the finished race in ~10% batches under ORO_LOGS."""
     if not PUSH_ORO_LOGS:
         return
     if not (ORO_LOGS_GIT_DIR / ".git").exists():
@@ -1115,46 +1270,90 @@ def push_oro_logs(label: str | None) -> None:
                 f"ORO_LOGS git push skipped: cannot read race number from {label!r}",
             )
         return
-    message = f"add: Race {number}"
+    if not label or not SAFE_SEGMENT.match(label):
+        with STATE.cond:
+            STATE.note_event(
+                "warn",
+                f"ORO_LOGS git push skipped: bad label {label!r}",
+            )
+        return
+
     with STATE.cond:
-        STATE.note_event("race", f"git commit/push ORO_LOGS ({message})")
+        STATE.note_event(
+            "race",
+            f"ORO_LOGS staged git push starting for Race {number}",
+        )
     try:
         ensure_oro_logs_ssh_remote()
-        paths = ["task_dictionary.json", "build_task_dictionary.py", ".gitignore"]
-        if label and SAFE_SEGMENT.match(label):
-            paths.append(f"races/{label}")
-        add = _git_run(
-            ["add", "--", *[p for p in paths if (ORO_LOGS_GIT_DIR / p).exists()
-                            or p.startswith("races/")]],
-            timeout=ORO_LOGS_GIT_TIMEOUT_SEC,
-        )
-        if add.returncode != 0:
-            err = (add.stderr or add.stdout or "git add failed").strip()
+        batches, total_size = _race_push_batches(label)
+        if not batches:
             with STATE.cond:
-                STATE.note_event("warn", f"ORO_LOGS git add failed: {err[:240]}")
-            return
-        staged = _git_run(["diff", "--cached", "--quiet"], timeout=60)
-        if staged.returncode == 0:
+                STATE.note_event(
+                    "warn",
+                    f"ORO_LOGS git: no files under races/{label}",
+                )
+        else:
+            total = len(batches)
             with STATE.cond:
-                STATE.note_event("race", "ORO_LOGS git: nothing new to commit")
-            return
-        commit = _git_run(
-            ["commit", "-m", message],
-            timeout=ORO_LOGS_GIT_TIMEOUT_SEC,
-        )
-        if commit.returncode != 0:
-            err = (commit.stderr or commit.stdout or "git commit failed").strip()
-            with STATE.cond:
-                STATE.note_event("warn", f"ORO_LOGS git commit failed: {err[:240]}")
-            return
-        push = _git_run(["push", "origin", "HEAD"], timeout=ORO_LOGS_GIT_TIMEOUT_SEC)
-        if push.returncode != 0:
-            err = (push.stderr or push.stdout or "git push failed").strip()
-            with STATE.cond:
-                STATE.note_event("warn", f"ORO_LOGS git push failed: {err[:240]}")
-            return
+                STATE.note_event(
+                    "race",
+                    f"ORO_LOGS git: {total} batches for Race {number} "
+                    f"({total_size / (1024 ** 3):.2f} GiB, "
+                    f"cap {ORO_LOGS_GIT_BATCH_MAX_BYTES / (1024 ** 3):.2f} GiB, "
+                    f"frac {ORO_LOGS_GIT_BATCH_FRAC:.0%})",
+                )
+            for i, batch in enumerate(batches, 1):
+                message = f"add: Race {number} ({i}/{total})"
+                marker = ORO_LOGS_GIT_DIR / f"_push_done_{label}_{i}.marker"
+                if marker.exists():
+                    with STATE.cond:
+                        STATE.note_event(
+                            "race",
+                            f"ORO_LOGS git: skip already pushed {message}",
+                        )
+                    continue
+                err = _git_add_paths(batch)
+                if err:
+                    with STATE.cond:
+                        STATE.note_event("warn", f"ORO_LOGS git add failed: {err[:240]}")
+                    return
+                err = _git_commit_and_push(message)
+                if err:
+                    with STATE.cond:
+                        STATE.note_event("warn", f"ORO_LOGS {err}")
+                    return
+                try:
+                    marker.write_text("ok\n", encoding="utf-8")
+                except OSError as marker_err:
+                    with STATE.cond:
+                        STATE.note_event(
+                            "warn",
+                            f"ORO_LOGS could not write {marker.name}: {marker_err}",
+                        )
+
+        # Final small commit for the rebuilt dictionary / tooling.
+        meta_paths = [
+            p for p in ("task_dictionary.json", "build_task_dictionary.py", ".gitignore")
+            if (ORO_LOGS_GIT_DIR / p).exists()
+        ]
+        if meta_paths:
+            err = _git_add_paths(meta_paths)
+            if err:
+                with STATE.cond:
+                    STATE.note_event("warn", f"ORO_LOGS git add failed: {err[:240]}")
+                return
+            err = _git_commit_and_push("update: task_dictionary.json")
+            if err:
+                # Nothing staged is fine (already committed).
+                if "failed" in err:
+                    with STATE.cond:
+                        STATE.note_event("warn", f"ORO_LOGS {err}")
+                    return
         with STATE.cond:
-            STATE.note_event("race", f"ORO_LOGS pushed: {message}")
+            STATE.note_event(
+                "race",
+                f"ORO_LOGS staged git push finished for Race {number}",
+            )
     except subprocess.TimeoutExpired:
         with STATE.cond:
             STATE.note_event(
