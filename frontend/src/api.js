@@ -32,6 +32,22 @@ export async function startRace(raceId, label) {
   return body;
 }
 
+export async function startQualifying(minScore, label) {
+  const payload = {};
+  const score = String(minScore ?? "").trim();
+  if (score !== "") payload.min_score = Number(score);
+  const lab = String(label ?? "").trim();
+  if (lab) payload.label = lab;
+  const res = await fetch("/api/qualifying", {
+    method: "POST",
+    headers: headers({ "Content-Type": "application/json" }),
+    body: JSON.stringify(payload),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+  return body;
+}
+
 export async function stopRace() {
   const res = await fetch("/api/races/stop", {
     method: "POST",

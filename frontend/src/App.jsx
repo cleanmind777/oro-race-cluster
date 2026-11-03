@@ -1,5 +1,12 @@
 import React, { useEffect, useRef, useState } from "react";
-import { getStatus, getToken, setToken, startRace, stopRace } from "./api.js";
+import {
+  getStatus,
+  getToken,
+  setToken,
+  startQualifying,
+  startRace,
+  stopRace,
+} from "./api.js";
 
 const POLL_MS = 1500;
 
@@ -26,6 +33,8 @@ function fmtClock(ts) {
 function StartRaceForm({ status, onStarted }) {
   const [raceId, setRaceId] = useState("");
   const [label, setLabel] = useState("");
+  const [minScore, setMinScore] = useState("0.55");
+  const [qualLabel, setQualLabel] = useState("qualifying");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [token, setTok] = useState(getToken());
@@ -34,6 +43,7 @@ function StartRaceForm({ status, onStarted }) {
     status &&
     ["waiting", "metadata", "episodes"].includes(status.phase) &&
     !status.complete;
+  const isQualifying = status && status.race_id === "qualifying";
 
   async function submit(event) {
     event.preventDefault();
@@ -49,8 +59,23 @@ function StartRaceForm({ status, onStarted }) {
     }
   }
 
+  async function submitQualifying(event) {
+    event.preventDefault();
+    setError("");
+    setBusy(true);
+    try {
+      await startQualifying(minScore, qualLabel);
+      onStarted();
+    } catch (err) {
+      setError(String(err.message || err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function stop() {
-    if (!window.confirm("Stop this race? Files already downloaded are kept.")) return;
+    if (!window.confirm("Stop this download? Files already downloaded are kept."))
+      return;
     setError("");
     setBusy(true);
     try {
@@ -64,62 +89,102 @@ function StartRaceForm({ status, onStarted }) {
   }
 
   return (
-    <form className="panel start" onSubmit={submit}>
-      <div className="row">
-        <label>
-          race_id
-          <input
-            value={raceId}
-            onChange={(e) => setRaceId(e.target.value)}
-            placeholder="51abddf9-0ea6-4afb-9b19-bd0bdc182af6"
-            spellCheck={false}
-          />
-        </label>
-        <label className="narrow">
-          label <span className="hint">(default race&lt;number&gt;)</span>
-          <input
-            value={label}
-            onChange={(e) => setLabel(e.target.value)}
-            placeholder="race2"
-            spellCheck={false}
-          />
-        </label>
-        <label className="narrow">
-          cluster token <span className="hint">(only if main sets one)</span>
-          <input
-            type="password"
-            value={token}
-            onChange={(e) => {
-              setTok(e.target.value);
-              setToken(e.target.value);
-            }}
-            placeholder="leave empty if unused"
-          />
-        </label>
-        <button type="submit" disabled={busy || !raceId.trim()}>
-          {busy
-            ? "Starting..."
-            : status && status.phase === "waiting"
-            ? "Waiting for publication"
-            : running
-            ? "Race running"
-            : "Start race"}
-        </button>
-        {running && (
-          <button type="button" className="danger" onClick={stop} disabled={busy}>
-            Stop race
+    <>
+      <form className="panel start" onSubmit={submit}>
+        <div className="row">
+          <label>
+            race_id
+            <input
+              value={raceId}
+              onChange={(e) => setRaceId(e.target.value)}
+              placeholder="51abddf9-0ea6-4afb-9b19-bd0bdc182af6"
+              spellCheck={false}
+              disabled={running}
+            />
+          </label>
+          <label className="narrow">
+            label <span className="hint">(default race&lt;number&gt;)</span>
+            <input
+              value={label}
+              onChange={(e) => setLabel(e.target.value)}
+              placeholder="race2"
+              spellCheck={false}
+              disabled={running}
+            />
+          </label>
+          <label className="narrow">
+            cluster token <span className="hint">(only if main sets one)</span>
+            <input
+              type="password"
+              value={token}
+              onChange={(e) => {
+                setTok(e.target.value);
+                setToken(e.target.value);
+              }}
+              placeholder="leave empty if unused"
+            />
+          </label>
+          <button type="submit" disabled={busy || running || !raceId.trim()}>
+            {busy
+              ? "Starting..."
+              : status && status.phase === "waiting"
+              ? "Waiting for publication"
+              : running
+              ? "Download running"
+              : "Start race"}
           </button>
-        )}
-      </div>
-      {error && <div className="error">{error}</div>}
-      {running && (
-        <div className="hint">
-          This race is already under way, and main picks it up again by itself
-          if it restarts. Stopping keeps every file already downloaded;
-          starting the same race_id later skips them.
+          {running && (
+            <button type="button" className="danger" onClick={stop} disabled={busy}>
+              Stop
+            </button>
+          )}
         </div>
-      )}
-    </form>
+      </form>
+      <form className="panel start" onSubmit={submitQualifying}>
+        <div className="row">
+          <label className="narrow">
+            min final_score
+            <input
+              value={minScore}
+              onChange={(e) => setMinScore(e.target.value)}
+              placeholder="0.55"
+              spellCheck={false}
+              disabled={running}
+            />
+          </label>
+          <label className="narrow">
+            qualifying label
+            <input
+              value={qualLabel}
+              onChange={(e) => setQualLabel(e.target.value)}
+              placeholder="qualifying"
+              spellCheck={false}
+              disabled={running}
+            />
+          </label>
+          <button type="submit" disabled={busy || running}>
+            {busy
+              ? "Starting..."
+              : running && isQualifying
+              ? "Qualifying running"
+              : "Start qualifying"}
+          </button>
+        </div>
+        <div className="hint">
+          Downloads QUALIFYING episode logs for public-leaderboard agents with
+          final_score ≥ the threshold (default 55%). Same cluster path as a race;
+          written under DATA_DIR/&lt;label&gt;/.
+        </div>
+        {error && <div className="error">{error}</div>}
+        {running && (
+          <div className="hint">
+            A download is already under way, and main picks it up again by itself
+            if it restarts. Stopping keeps every file already downloaded;
+            starting the same race_id or qualifying label later skips them.
+          </div>
+        )}
+      </form>
+    </>
   );
 }
 
@@ -128,16 +193,25 @@ function WaitBar({ status }) {
   const since = status.started_at
     ? Math.round((status.now - status.started_at) / 60)
     : 0;
+  const isQualifying = status.race_id === "qualifying";
   return (
     <div className="panel phases">
       <div className="phase">
         <div className="phase-head">
           <span className="dot live" />
-          <strong>0. waiting for publication</strong>
+          <strong>
+            {isQualifying ? "0. loading leaderboard" : "0. waiting for publication"}
+          </strong>
           <span className="hint">
-            {watch.note || "checking"} &middot; checked {watch.checks || 0}&times;
-            {watch.interval ? ` every ${Math.round(watch.interval)}s` : ""}
-            {since ? ` · waiting ${since} min` : ""}
+            {watch.note || "checking"}
+            {!isQualifying && (
+              <>
+                {" "}
+                &middot; checked {watch.checks || 0}&times;
+                {watch.interval ? ` every ${Math.round(watch.interval)}s` : ""}
+                {since ? ` · waiting ${since} min` : ""}
+              </>
+            )}
           </span>
         </div>
         <div className="bar">
@@ -145,9 +219,9 @@ function WaitBar({ status }) {
         </div>
       </div>
       <div className="hint">
-        ORO publishes episode logs some hours after a race ends. Main keeps
-        checking and starts the cluster by itself, re-reading the metadata then
-        in case it changed while waiting.
+        {isQualifying
+          ? "Main is paging the public leaderboard for agents above the score threshold, then enqueues their QUALIFYING runs."
+          : "ORO publishes episode logs some hours after a race ends. Main keeps checking and starts the cluster by itself, re-reading the metadata then in case it changed while waiting."}
       </div>
     </div>
   );
@@ -170,10 +244,12 @@ function PhaseBar({ status }) {
           <span className={`dot ${status.phase === "metadata" ? "live" : metaDone ? "ok" : ""}`} />
           <strong>1. metadata</strong>
           <span className="hint">
-            files {meta.files_done}/{meta.files_total || "?"} &middot; qualifiers{" "}
-            {meta.agents_done}/{meta.agents_total || "?"} &middot; included RACE runs{" "}
+            files {meta.files_done}/{meta.files_total || "?"} &middot; agents{" "}
+            {meta.agents_done}/{meta.agents_total || "?"} &middot; included{" "}
+            {status.race_id === "qualifying" ? "QUALIFYING" : "RACE"} runs{" "}
             {meta.runs_saved}/{meta.runs_included} &middot; episodes found{" "}
             {meta.episodes_found}
+            {meta.min_score != null ? ` · min_score ${meta.min_score}` : ""}
             {meta.oro_429 ? ` · ${meta.oro_429} 429s` : ""}
           </span>
         </div>

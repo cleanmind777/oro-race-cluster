@@ -18,6 +18,7 @@ import os
 import platform
 import queue
 import re
+import ssl
 import threading
 import time
 import urllib.error
@@ -73,6 +74,32 @@ USER_AGENT = "oro-race-cluster-worker/1.0"
 
 def log(msg: str) -> None:
     print(f"[{WORKER_ID} {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def _ssl_context() -> ssl.SSLContext:
+    """CA bundle for HTTPS to ORO (and MAIN_URL if it is https).
+
+    Stock Windows Python often ships without usable system CAs, which shows up as
+    CERTIFICATE_VERIFY_FAILED / unable to get local issuer certificate. Prefer an
+    explicit SSL_CERT_FILE / REQUESTS_CA_BUNDLE, then certifi, then the default.
+    """
+    for key in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"):
+        path = (os.environ.get(key) or "").strip()
+        if path and Path(path).is_file():
+            log(f"SSL: using CA bundle from {key}={path}")
+            return ssl.create_default_context(cafile=path)
+    try:
+        import certifi  # type: ignore[import-not-found]
+        path = certifi.where()
+        log(f"SSL: using certifi CA bundle ({path})")
+        return ssl.create_default_context(cafile=path)
+    except Exception:
+        log("SSL: using system default CA store "
+            "(on Windows: pip install certifi if downloads fail verify)")
+        return ssl.create_default_context()
+
+
+SSL_CONTEXT = _ssl_context()
 
 
 # --------------------------------------------------------------------------- #
@@ -178,7 +205,7 @@ def main_request(method: str, path: str, data: bytes | None = None,
         headers["Content-Type"] = ctype
     req = urllib.request.Request(MAIN_URL + path, data=data, headers=headers,
                                  method=method)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.urlopen(req, timeout=timeout, context=SSL_CONTEXT) as resp:
         body = resp.read()
         return resp.status, body
 
@@ -205,7 +232,9 @@ def oro_get(url: str, attempts: int = 8, timeout: float = 120.0) -> bytes:
             },
         )
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with urllib.request.urlopen(
+                req, timeout=timeout, context=SSL_CONTEXT,
+            ) as resp:
                 return read_http_body(resp)
         except urllib.error.HTTPError as err:
             err.read()

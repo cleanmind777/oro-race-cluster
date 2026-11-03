@@ -165,12 +165,14 @@ needs rsync or tar.
    *"Add python.exe to PATH"* during setup.
    Avoid the Microsoft Store build; its `python3` alias confuses process managers.
 2. **Node LTS** from <https://nodejs.org/>.
-3. Open **PowerShell** and install PM2:
+3. Open **PowerShell** and install PM2 plus a CA bundle (needed for HTTPS to ORO;
+   without it Windows often fails with `SSL: CERTIFICATE_VERIFY_FAILED`):
 
 ```powershell
 python --version
 node --version
 npm install -g pm2
+python -m pip install --upgrade certifi
 ```
 
 ### 4.2 Configure `.env`
@@ -443,5 +445,6 @@ units immediately, including stolen tail work from slower machines.
 | `pm2 start` says `Script already launched` | a stray `ecosystem.worker` entry from an interrupted start; `pm2 delete ecosystem.worker` then start again |
 | `ecosystem.worker` is listed and `oro-worker` is not | the handover to PM2 failed, common on Windows. `pm2 logs ecosystem.worker --lines 30 --nostream` says why; then `pm2 delete ecosystem.worker` and use the direct start in section 4.3. Only `oro-worker` should ever be listed |
 | Windows: `interpreter python3 not found` | an older copy of the PM2 files; update them, or set `PYTHON` in `.env` to the full `python.exe` path |
+| Windows: `SSL: CERTIFICATE_VERIFY_FAILED` / `unable to get local issuer certificate` | Python has no usable CA store. `python -m pip install --upgrade certifi`, copy the updated `oro_worker.py` (it loads certifi automatically), then `pm2 restart oro-worker`. Or set `SSL_CERT_FILE` in `.env` to the path printed by `python -c "import certifi; print(certifi.where())"` |
 | Windows: nothing runs after reboot | `pm2 save` was not run, or the Task Scheduler task runs as a different user than the one that saved |
 | adding the machine did not speed things up | it shares a public IP with another worker |

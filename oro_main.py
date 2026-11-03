@@ -7,6 +7,7 @@ single durable copy of the data under DATA_DIR/<label>/.
 CLI:
     python oro_main.py serve
     python oro_main.py start --race-id UUID [--label race2]
+    python oro_main.py start-qualifying [--min-score 0.55] [--label qualifying]
     python oro_main.py status
 """
 
@@ -108,6 +109,10 @@ ORO_LOGS_GIT_BATCH_MAX_BYTES = int(os.environ.get(
 ))
 ORO_LOGS_GIT_PUSH_ATTEMPTS = int(os.environ.get("ORO_LOGS_GIT_PUSH_ATTEMPTS", "7"))
 _task_dict_lock = threading.Lock()
+# Qualifying download: agents from the public leaderboard with final_score >= this.
+QUALIFYING_MIN_SCORE = float(os.environ.get("QUALIFYING_MIN_SCORE", "0.55"))
+QUALIFYING_RACE_ID = "qualifying"
+QUALIFYING_LABEL_DEFAULT = "qualifying"
 
 # main's metadata fetch shares its public IP with main's local worker, so it
 # takes half of the ~98/min budget by default
@@ -619,11 +624,16 @@ def race_cancelled(generation: int) -> bool:
 
 
 def included_runs(raw_runs: bytes, race_id: str) -> list[dict]:
-    """The RACE runs of one agent that count for this race."""
+    """Runs to download for one agent: RACE for a race_id, or QUALIFYING."""
     try:
         runs = json.loads(raw_runs)
     except json.JSONDecodeError:
         return []
+    if race_id == QUALIFYING_RACE_ID:
+        return [r for r in runs
+                if r.get("phase") == "QUALIFYING"
+                and r.get("is_included") is True
+                and r.get("status") != "STALE"]
     return [r for r in runs
             if str(r.get("race_id")) == race_id
             and r.get("phase") == "RACE"
@@ -863,42 +873,13 @@ def start_race(race_id: str, label: str | None) -> dict:
     race_dir(label)  # validates
 
     with STATE.cond:
-        STATE.generation += 1
-        STATE.race_id = race_id
-        STATE.label = label
-        STATE.phase = "waiting"  # the watcher moves it on when the logs exist
-        STATE.started_at = time.time()
-        STATE.finished_at = None
-        STATE.meta = {"agents_total": 0, "agents_done": 0, "runs_included": 0,
-                      "runs_saved": 0, "episodes_found": 0, "refresh": False}
-        STATE.watch = {"checks": 0, "note": "starting", "last_check": 0.0}
-        STATE.pending_meta.clear()
-        STATE.to_expand.clear()
-        STATE.meta_files_total = 0
-        STATE.meta_files_done = 0
-        STATE.failures.clear()
-        STATE.given_up.clear()
-        STATE.pending.clear()
-        STATE.jobs.clear()
-        STATE.done_set.clear()
-        STATE.completions.clear()
-        STATE.preexisting = 0
-        STATE.total_items = 0
-        STATE.requeues = 0
-        STATE.steals = 0
-        STATE.metadata_429 = 0
-        for worker in STATE.workers.values():
-            worker.job_id = None
-            worker.in_flight = 0
-            worker.files_done = 0
-            worker.units_done = 0
-            worker.bytes = 0
-            worker.oro_429 = 0
-            worker.completions.clear()
+        generation = _reset_download_state(
+            race_id, label, phase="waiting", note="starting",
+        )
         STATE.note_event("race", f"start {race_id} -> {label}")
         save_race_state(race_id, label, complete=False)
         thread = threading.Thread(target=race_watcher,
-                                  args=(race_id, label, STATE.generation),
+                                  args=(race_id, label, generation),
                                   daemon=True, name="watcher")
         STATE.meta_thread = thread
         thread.start()
@@ -937,7 +918,10 @@ def resume_saved_race() -> None:
         return
     time.sleep(1.0)  # let the listener come up, so workers can reconnect at once
     try:
-        start_race(saved["race_id"], saved.get("label") or None)
+        if saved["race_id"] == QUALIFYING_RACE_ID:
+            start_qualifying(label=saved.get("label") or QUALIFYING_LABEL_DEFAULT)
+        else:
+            start_race(saved["race_id"], saved.get("label") or None)
     except Exception as err:  # noqa: BLE001 - never take the server down for this
         log(f"could not resume the saved race: {err}")
         return
@@ -950,6 +934,205 @@ def resolve_label(race_id: str) -> str:
     raw = oro_get(f"/v1/public/races/{race_id}", STATE.limiter)
     number = (json.loads(raw).get("race") or {}).get("race_number")
     return f"race{number}" if number is not None else f"race-{race_id[:8]}"
+
+
+def fetch_leaderboard_agents(min_score: float, limiter: "RateLimiter",
+                             on_429) -> list[dict]:
+    """All public leaderboard entries with final_score >= min_score."""
+    agents: list[dict] = []
+    offset = 0
+    total = None
+    while True:
+        raw = oro_get(
+            f"/v1/public/leaderboard?limit=100&offset={offset}",
+            limiter,
+            on_429=on_429,
+        )
+        data = json.loads(raw)
+        if total is None:
+            total = int(data.get("total") or 0)
+        entries = data.get("entries") or []
+        if not entries:
+            break
+        for entry in entries:
+            score = entry.get("final_score")
+            if isinstance(score, (int, float)) and score >= min_score:
+                agents.append(entry)
+        offset += len(entries)
+        if total and offset >= total:
+            break
+        if len(entries) < 100:
+            break
+    # stable order: highest score first, then agent id
+    agents.sort(
+        key=lambda e: (-(e.get("final_score") or 0), str(e.get("agent_version_id") or "")),
+    )
+    return agents
+
+
+def _reset_download_state(race_id: str, label: str, *, phase: str, note: str) -> int:
+    """Clear queues and start a new download generation. Caller holds STATE.cond."""
+    STATE.generation += 1
+    generation = STATE.generation
+    STATE.race_id = race_id
+    STATE.label = label
+    STATE.phase = phase
+    STATE.started_at = time.time()
+    STATE.finished_at = None
+    STATE.meta = {"agents_total": 0, "agents_done": 0, "runs_included": 0,
+                  "runs_saved": 0, "episodes_found": 0, "refresh": False,
+                  "min_score": None}
+    STATE.watch = {"checks": 0, "note": note, "last_check": 0.0}
+    STATE.pending_meta.clear()
+    STATE.to_expand.clear()
+    STATE.meta_files_total = 0
+    STATE.meta_files_done = 0
+    STATE.failures.clear()
+    STATE.given_up.clear()
+    STATE.pending.clear()
+    STATE.jobs.clear()
+    STATE.done_set.clear()
+    STATE.completions.clear()
+    STATE.preexisting = 0
+    STATE.total_items = 0
+    STATE.requeues = 0
+    STATE.steals = 0
+    STATE.metadata_429 = 0
+    for worker in STATE.workers.values():
+        worker.job_id = None
+        worker.in_flight = 0
+        worker.files_done = 0
+        worker.units_done = 0
+        worker.bytes = 0
+        worker.oro_429 = 0
+        worker.completions.clear()
+    return generation
+
+
+def qualifying_bootstrap(label: str, min_score: float, generation: int) -> None:
+    """List leaderboard agents and enqueue their runs.json metadata files."""
+    limiter = STATE.limiter
+
+    def on_429() -> None:
+        with STATE.cond:
+            STATE.oro_429_total += 1
+            STATE.metadata_429 += 1
+
+    try:
+        agents = fetch_leaderboard_agents(min_score, limiter, on_429)
+    except Exception as err:  # noqa: BLE001
+        with STATE.cond:
+            if STATE.generation != generation:
+                return
+            STATE.phase = "error"
+            STATE.note_event("warn", f"qualifying leaderboard failed: {err}")
+            save_race_state(QUALIFYING_RACE_ID, label, complete=True)
+        return
+
+    if race_cancelled(generation):
+        return
+
+    # Snapshot who we selected, next to the downloads.
+    snapshot = {
+        "min_score": min_score,
+        "selected": len(agents),
+        "agents": [
+            {
+                "agent_version_id": a.get("agent_version_id"),
+                "agent_name": a.get("agent_name"),
+                "final_score": a.get("final_score"),
+                "rank": a.get("rank"),
+                "miner_hotkey": a.get("miner_hotkey"),
+            }
+            for a in agents
+        ],
+    }
+    try:
+        write_atomic(
+            race_dir(label) / "leaderboard_selected.json",
+            json.dumps(snapshot, indent=2).encode(),
+        )
+    except OSError as err:
+        with STATE.cond:
+            STATE.note_event("warn", f"could not write leaderboard_selected.json: {err}")
+
+    agent_ids: list[str] = []
+    seen: set[str] = set()
+    for entry in agents:
+        agent_id = entry.get("agent_version_id")
+        if not agent_id or agent_id in seen:
+            continue
+        seen.add(agent_id)
+        agent_ids.append(agent_id)
+
+    with STATE.cond:
+        if STATE.generation != generation:
+            return
+        STATE.phase = "metadata"
+        STATE.meta["agents_total"] = len(agent_ids)
+        STATE.meta["min_score"] = min_score
+        STATE.meta["refresh"] = False
+        STATE.note_event(
+            "metadata",
+            f"qualifying: {len(agent_ids)} agents with final_score >= {min_score:g}",
+        )
+        if not agent_ids:
+            STATE.phase = "episodes"
+            STATE.finished_at = time.time()
+            save_race_state(QUALIFYING_RACE_ID, label, complete=True)
+            STATE.note_event("race", "qualifying: no agents matched the score filter")
+            return
+        STATE.enqueue_meta(
+            label,
+            [(f"agents/{a}/runs.json",
+              f"{API_BASE}/v1/public/agent-versions/{a}/runs") for a in agent_ids],
+            refresh=False,
+        )
+        STATE.cond.notify_all()
+
+
+def start_qualifying(min_score: float | None = None,
+                     label: str | None = None) -> dict:
+    """Download QUALIFYING episode logs for leaderboard agents above min_score."""
+    score = QUALIFYING_MIN_SCORE if min_score is None else float(min_score)
+    if score < 0 or score > 1:
+        raise UnsafePath("min_score must be between 0 and 1")
+    label = (label or QUALIFYING_LABEL_DEFAULT).strip() or QUALIFYING_LABEL_DEFAULT
+    race_dir(label)  # validates
+
+    with STATE.cond:
+        busy = STATE.phase in ("metadata", "episodes", "waiting") and not STATE.is_complete()
+        if busy:
+            raise RuntimeError(f"race {STATE.race_id} is still running ({STATE.phase})")
+        # Stay in "waiting" until the leaderboard is loaded and runs.json work
+        # is enqueued. Starting in "metadata" with an empty queue lets the
+        # expander mark the race complete before bootstrap finishes.
+        generation = _reset_download_state(
+            QUALIFYING_RACE_ID,
+            label,
+            phase="waiting",
+            note=f"loading leaderboard (min_score={score:g})",
+        )
+        STATE.meta["min_score"] = score
+        STATE.note_event(
+            "race",
+            f"start qualifying -> {label} (final_score >= {score:g})",
+        )
+        save_race_state(QUALIFYING_RACE_ID, label, complete=False)
+        thread = threading.Thread(
+            target=qualifying_bootstrap,
+            args=(label, score, generation),
+            daemon=True,
+            name="qualifying",
+        )
+        STATE.meta_thread = thread
+        thread.start()
+        return {
+            "race_id": QUALIFYING_RACE_ID,
+            "label": label,
+            "phase": STATE.phase,
+            "min_score": score,
+        }
 
 
 # --------------------------------------------------------------------------- #
@@ -1262,14 +1445,6 @@ def push_oro_logs(label: str | None) -> None:
                 f"ORO_LOGS git push skipped: not a repo ({ORO_LOGS_GIT_DIR})",
             )
         return
-    number = race_number_label(label)
-    if not number:
-        with STATE.cond:
-            STATE.note_event(
-                "warn",
-                f"ORO_LOGS git push skipped: cannot read race number from {label!r}",
-            )
-        return
     if not label or not SAFE_SEGMENT.match(label):
         with STATE.cond:
             STATE.note_event(
@@ -1277,11 +1452,23 @@ def push_oro_logs(label: str | None) -> None:
                 f"ORO_LOGS git push skipped: bad label {label!r}",
             )
         return
+    number = race_number_label(label)
+    if label == QUALIFYING_LABEL_DEFAULT or label.lower().startswith("qualifying"):
+        commit_prefix = "add: Qualifying"
+    elif number:
+        commit_prefix = f"add: Race {number}"
+    else:
+        with STATE.cond:
+            STATE.note_event(
+                "warn",
+                f"ORO_LOGS git push skipped: cannot read race number from {label!r}",
+            )
+        return
 
     with STATE.cond:
         STATE.note_event(
             "race",
-            f"ORO_LOGS staged git push starting for Race {number}",
+            f"ORO_LOGS staged git push starting for {commit_prefix}",
         )
     try:
         ensure_oro_logs_ssh_remote()
@@ -1297,13 +1484,13 @@ def push_oro_logs(label: str | None) -> None:
             with STATE.cond:
                 STATE.note_event(
                     "race",
-                    f"ORO_LOGS git: {total} batches for Race {number} "
+                    f"ORO_LOGS git: {total} batches for {commit_prefix} "
                     f"({total_size / (1024 ** 3):.2f} GiB, "
                     f"cap {ORO_LOGS_GIT_BATCH_MAX_BYTES / (1024 ** 3):.2f} GiB, "
                     f"frac {ORO_LOGS_GIT_BATCH_FRAC:.0%})",
                 )
             for i, batch in enumerate(batches, 1):
-                message = f"add: Race {number} ({i}/{total})"
+                message = f"{commit_prefix} ({i}/{total})"
                 marker = ORO_LOGS_GIT_DIR / f"_push_done_{label}_{i}.marker"
                 if marker.exists():
                     with STATE.cond:
@@ -1352,7 +1539,7 @@ def push_oro_logs(label: str | None) -> None:
         with STATE.cond:
             STATE.note_event(
                 "race",
-                f"ORO_LOGS staged git push finished for Race {number}",
+                f"ORO_LOGS staged git push finished for {commit_prefix}",
             )
     except subprocess.TimeoutExpired:
         with STATE.cond:
@@ -1710,6 +1897,31 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(502, {"error": f"could not start: {err}"})
             return self._json(200, result)
 
+        if path == "/api/qualifying":
+            if not self._ui_gate(mutating=True):
+                return
+            try:
+                payload = json.loads(self._body() or b"{}")
+            except json.JSONDecodeError:
+                return self._json(400, {"error": "invalid JSON"})
+            try:
+                min_score = payload.get("min_score", None)
+                if min_score is not None and min_score != "":
+                    min_score = float(min_score)
+                else:
+                    min_score = None
+                result = start_qualifying(
+                    min_score=min_score,
+                    label=(payload.get("label") or "").strip() or None,
+                )
+            except (UnsafePath, TypeError, ValueError) as err:
+                return self._json(400, {"error": str(err)})
+            except RuntimeError as err:
+                return self._json(409, {"error": str(err)})
+            except Exception as err:  # noqa: BLE001
+                return self._json(502, {"error": f"could not start: {err}"})
+            return self._json(200, result)
+
         if path == "/api/races/stop":
             if not self._ui_gate(mutating=True):
                 return
@@ -1954,6 +2166,15 @@ def cmd_start(args) -> None:
     sys.exit(0 if code == 200 else 1)
 
 
+def cmd_start_qualifying(args) -> None:
+    payload = {"label": args.label}
+    if args.min_score is not None:
+        payload["min_score"] = args.min_score
+    code, body = api_call("POST", "/api/qualifying", payload)
+    print(json.dumps(body, indent=2))
+    sys.exit(0 if code == 200 else 1)
+
+
 def cmd_stop(_args) -> None:
     code, body = api_call("POST", "/api/races/stop")
     print(json.dumps(body, indent=2))
@@ -1974,9 +2195,13 @@ def cmd_status(_args) -> None:
         print(f"waiting: {w.get('note', '')}  (checked {w.get('checks', 0)}x, "
               f"every {w.get('interval', 0):.0f}s)")
     m = s["metadata"]
+    score_note = ""
+    if m.get("min_score") is not None:
+        score_note = f"  min_score {m['min_score']}"
     print(f"meta   : files {m.get('files_done', 0)}/{m.get('files_total', 0)}  "
           f"agents {m['agents_done']}/{m['agents_total']}  "
-          f"runs {m['runs_saved']}/{m['runs_included']}  episodes {m['episodes_found']}")
+          f"runs {m['runs_saved']}/{m['runs_included']}  episodes {m['episodes_found']}"
+          f"{score_note}")
     print(f"files  : done {t['done']}/{t['total']} ({t['percent']}%)  "
           f"pending {t['pending']}  in-flight {t['in_flight']}  "
           f"pre-existing {t['preexisting']}")
@@ -2000,6 +2225,19 @@ def main() -> None:
     start.add_argument("--race-id", required=True)
     start.add_argument("--label", default=None, help="default: race<race_number>")
     start.set_defaults(func=cmd_start)
+    qualify = sub.add_parser(
+        "start-qualifying",
+        help="download QUALIFYING logs for leaderboard agents above min_score",
+    )
+    qualify.add_argument(
+        "--min-score", type=float, default=None,
+        help=f"minimum final_score (default {QUALIFYING_MIN_SCORE:g})",
+    )
+    qualify.add_argument(
+        "--label", default=None,
+        help=f"data folder under DATA_DIR (default {QUALIFYING_LABEL_DEFAULT})",
+    )
+    qualify.set_defaults(func=cmd_start_qualifying)
     sub.add_parser("stop", help="stop the running race, keeping downloaded files") \
         .set_defaults(func=cmd_stop)
     sub.add_parser("status", help="print cluster status").set_defaults(func=cmd_status)
