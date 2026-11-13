@@ -1,0 +1,13 @@
+{
+  "disabled_workers": [
+    "captain-1",
+    "captain-windows",
+    "home-hsk0518",
+    "home-hsk0518-probe",
+    "koko-1",
+    "local",
+    "pampam-trading",
+    "pampam_ireland"
+  ],
+  "saved_at": 1794556790.0850096
+}

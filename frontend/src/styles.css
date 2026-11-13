@@ -264,6 +264,19 @@ tr.offline td {
   color: var(--bad);
 }
 
+.pill.paused {
+  background: #21262d;
+  color: #8b949e;
+}
+
+.worker-controls {
+  margin-bottom: 12px;
+}
+
+.worker-controls button {
+  margin-right: 8px;
+}
+
 .pill.requeue,
 .pill.warn,
 .pill.rate-limited {

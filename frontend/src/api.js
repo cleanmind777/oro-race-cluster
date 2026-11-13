@@ -57,3 +57,45 @@ export async function stopRace() {
   if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
   return body;
 }
+
+export async function pauseWorker(workerId) {
+  const id = encodeURIComponent(String(workerId || "").trim());
+  const res = await fetch(`/api/workers/${id}/pause`, {
+    method: "POST",
+    headers: headers({ "Content-Type": "application/json" }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+  return body;
+}
+
+export async function resumeWorker(workerId) {
+  const id = encodeURIComponent(String(workerId || "").trim());
+  const res = await fetch(`/api/workers/${id}/resume`, {
+    method: "POST",
+    headers: headers({ "Content-Type": "application/json" }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+  return body;
+}
+
+export async function pauseAllWorkers() {
+  const res = await fetch("/api/workers/pause-all", {
+    method: "POST",
+    headers: headers({ "Content-Type": "application/json" }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+  return body;
+}
+
+export async function resumeAllWorkers() {
+  const res = await fetch("/api/workers/resume-all", {
+    method: "POST",
+    headers: headers({ "Content-Type": "application/json" }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+  return body;
+}

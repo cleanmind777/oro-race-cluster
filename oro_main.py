@@ -102,6 +102,11 @@ DATA_DIR = Path(os.environ.get("DATA_DIR") or (ROOT / "Data" / "races")).resolve
 # which race is in progress, so a restart continues instead of forgetting; kept
 # out of DATA_DIR because only raw API bodies belong there
 STATE_FILE = Path(os.environ.get("STATE_FILE") or (ROOT / ".oro-main-state.json"))
+# Dashboard-paused worker_ids survive main restarts (soft off: no new jobs).
+WORKER_CONTROL_FILE = Path(os.environ.get(
+    "WORKER_CONTROL_FILE",
+    str(STATE_FILE.with_name(".oro-worker-control.json")),
+))
 AUTO_RESUME = os.environ.get("AUTO_RESUME", "1").strip() not in ("0", "false", "no")
 DIST_DIR = Path(os.environ.get("DIST_DIR") or (ROOT / "frontend" / "dist")).resolve()
 # After a race download finishes, rebuild task_dictionary.json from the race
@@ -451,6 +456,80 @@ def load_race_state() -> dict | None:
     return saved if isinstance(saved, dict) else None
 
 
+def save_worker_control() -> None:
+    """Persist dashboard-paused worker_ids. Caller may hold STATE.cond."""
+    try:
+        disabled = sorted(STATE.disabled_workers)
+        write_atomic(WORKER_CONTROL_FILE, json.dumps({
+            "disabled_workers": disabled,
+            "saved_at": time.time(),
+        }, indent=2).encode())
+    except OSError as err:
+        log(f"could not write {WORKER_CONTROL_FILE}: {err}")
+
+
+def load_worker_control() -> None:
+    """Restore paused workers from disk into STATE (lock held by caller or at start)."""
+    try:
+        raw = json.loads(WORKER_CONTROL_FILE.read_bytes())
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(raw, dict):
+        return
+    ids = raw.get("disabled_workers") or []
+    if not isinstance(ids, list):
+        return
+    cleaned = {
+        str(w).strip() for w in ids
+        if isinstance(w, str) and w.strip() and SAFE_SEGMENT.match(w.strip())
+    }
+    STATE.disabled_workers = cleaned
+    if cleaned:
+        log(f"worker control: {len(cleaned)} paused: " + ", ".join(sorted(cleaned)))
+
+
+def set_worker_enabled(worker_id: str, enabled: bool) -> dict:
+    """Dashboard pause/resume. Soft: no new jobs; in-flight units may finish."""
+    worker_id = (worker_id or "").strip()
+    if not worker_id or not SAFE_SEGMENT.match(worker_id):
+        raise UnsafePath("worker_id must be a simple name (letters, digits, ._-)")
+    with STATE.cond:
+        if enabled:
+            STATE.disabled_workers.discard(worker_id)
+            STATE.note_event("worker", f"{worker_id} resumed (dashboard)")
+        else:
+            STATE.disabled_workers.add(worker_id)
+            STATE.note_event("worker", f"{worker_id} paused (dashboard)")
+        save_worker_control()
+        STATE.cond.notify_all()
+        return {
+            "worker_id": worker_id,
+            "enabled": enabled,
+            "disabled_workers": sorted(STATE.disabled_workers),
+        }
+
+
+def set_all_workers_enabled(enabled: bool) -> dict:
+    """Pause or resume every worker currently known, plus clear/set by known ids."""
+    with STATE.cond:
+        known = set(STATE.workers.keys()) | set(STATE.disabled_workers)
+        if enabled:
+            STATE.disabled_workers.clear()
+            STATE.note_event("worker", "all workers resumed (dashboard)")
+        else:
+            STATE.disabled_workers |= known
+            STATE.note_event(
+                "worker",
+                f"paused {len(STATE.disabled_workers)} worker(s) (dashboard)",
+            )
+        save_worker_control()
+        STATE.cond.notify_all()
+        return {
+            "enabled": enabled,
+            "disabled_workers": sorted(STATE.disabled_workers),
+        }
+
+
 def exists_nonempty(path: Path) -> bool:
     try:
         return path.stat().st_size > 0
@@ -490,9 +569,11 @@ class Worker:
         span = max(now - self.completions[0], 30.0)
         return len(self.completions) * 60.0 / span
 
-    def status(self, now: float) -> str:
+    def status(self, now: float, *, enabled: bool = True) -> str:
         if now - self.last_seen > WORKER_OFFLINE_SEC:
             return "offline"
+        if not enabled:
+            return "paused"
         if now < self.paused_until:
             return "rate-limited"
         return "downloading" if self.job_id else "waiting"
@@ -533,6 +614,8 @@ class State:
         self.generation = 0  # bumped on start/stop so a stale metadata thread quits
         self.meta_thread: threading.Thread | None = None
         self.limiter = RateLimiter()
+        # worker_ids the dashboard turned off; they may still long-poll
+        self.disabled_workers: set[str] = set()
 
     # -- helpers (call with lock held) ------------------------------------- #
     def note_event(self, kind: str, msg: str) -> None:
@@ -1188,6 +1271,8 @@ def steal_tail(worker: Worker) -> None:
 
 def take_unit(worker: Worker) -> dict | None:
     """Hand out ONE small unit, metadata before episodes. Caller holds cond."""
+    if worker.worker_id in STATE.disabled_workers:
+        return None
     label = STATE.label
     if not label:
         return None
@@ -1694,9 +1779,11 @@ def status_payload() -> dict:
         eta = remaining / fpm * 60.0 if fpm > 0.01 and remaining else None
         workers = []
         for worker in sorted(STATE.workers.values(), key=lambda w: w.worker_id):
+            enabled = worker.worker_id not in STATE.disabled_workers
             workers.append({
                 "worker_id": worker.worker_id,
-                "status": worker.status(now),
+                "status": worker.status(now, enabled=enabled),
+                "enabled": enabled,
                 "files_done": worker.files_done,
                 "units_done": worker.units_done,
                 "in_flight": worker.in_flight,
@@ -1712,6 +1799,7 @@ def status_payload() -> dict:
             "label": STATE.label,
             "phase": STATE.phase,
             "complete": STATE.is_complete(),
+            "disabled_workers": sorted(STATE.disabled_workers),
             "started_at": STATE.started_at,
             "finished_at": STATE.finished_at,
             "metadata": dict(STATE.meta, oro_429=STATE.metadata_429,
@@ -1991,7 +2079,27 @@ class Handler(BaseHTTPRequestHandler):
                 return
             return self._json(200, stop_race())
 
+        if path == "/api/workers/pause-all":
+            if not self._ui_gate(mutating=True):
+                return
+            return self._json(200, set_all_workers_enabled(False))
+
+        if path == "/api/workers/resume-all":
+            if not self._ui_gate(mutating=True):
+                return
+            return self._json(200, set_all_workers_enabled(True))
+
         parts = path.strip("/").split("/")
+        if (len(parts) == 4 and parts[0] == "api" and parts[1] == "workers"
+                and parts[3] in ("pause", "resume")):
+            if not self._ui_gate(mutating=True):
+                return
+            try:
+                result = set_worker_enabled(parts[2], enabled=(parts[3] == "resume"))
+            except UnsafePath as err:
+                return self._json(400, {"error": str(err)})
+            return self._json(200, result)
+
         if len(parts) == 4 and parts[0] == "api" and parts[1] == "work":
             if not self._worker_gate():
                 return
@@ -2050,7 +2158,9 @@ class Handler(BaseHTTPRequestHandler):
         with STATE.cond:
             worker = self._worker(worker_id)
             while True:
-                if STATE.phase in ("metadata", "episodes"):
+                disabled = worker_id in STATE.disabled_workers
+                if (not disabled
+                        and STATE.phase in ("metadata", "episodes")):
                     unit = take_unit(worker)  # may steal a tail if the queue is empty
                     if unit:
                         return self._json(200, unit)
@@ -2171,6 +2281,8 @@ class Server(ThreadingHTTPServer):
 
 def cmd_serve(_args) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with STATE.cond:
+        load_worker_control()
     threading.Thread(target=watchdog, daemon=True, name="watchdog").start()
     threading.Thread(target=expander, daemon=True, name="expander").start()
     server = Server((BIND_HOST, BIND_PORT), Handler)
@@ -2292,7 +2404,10 @@ def cmd_status(_args) -> None:
     print(f"{'worker':<22}{'status':<13}{'done':>7}{'units':>7}{'flight':>7}"
           f"{'epm':>8}{'429':>5}{'MB':>9}{'seen':>7}")
     for w in s["workers"]:
-        print(f"{w['worker_id'][:21]:<22}{w['status']:<13}{w['files_done']:>7}"
+        st = w["status"]
+        if w.get("enabled") is False and st != "paused":
+            st = f"{st}/off"
+        print(f"{w['worker_id'][:21]:<22}{st:<13}{w['files_done']:>7}"
               f"{w['units_done']:>7}{w['in_flight']:>7}{w['epm']:>8.1f}"
               f"{w['oro_429_count']:>5}{w['bytes'] / 1e6:>9.1f}"
               f"{w['last_seen_ago']:>6.0f}s")

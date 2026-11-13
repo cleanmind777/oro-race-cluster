@@ -2,6 +2,10 @@ import React, { useEffect, useRef, useState } from "react";
 import {
   getStatus,
   getToken,
+  pauseAllWorkers,
+  pauseWorker,
+  resumeAllWorkers,
+  resumeWorker,
   setToken,
   startQualifying,
   startRace,
@@ -307,9 +311,41 @@ function Totals({ status }) {
   );
 }
 
-function WorkerTable({ status }) {
+function WorkerTable({ status, onChanged }) {
   const workers = status.workers || [];
   const maxEpm = Math.max(1, ...workers.map((w) => w.epm));
+  const [busyId, setBusyId] = useState("");
+  const [error, setError] = useState("");
+
+  async function toggle(worker) {
+    const id = worker.worker_id;
+    setError("");
+    setBusyId(id);
+    try {
+      if (worker.enabled === false) await resumeWorker(id);
+      else await pauseWorker(id);
+      onChanged && onChanged();
+    } catch (err) {
+      setError(String(err.message || err));
+    } finally {
+      setBusyId("");
+    }
+  }
+
+  async function all(enabled) {
+    setError("");
+    setBusyId(enabled ? "__resume_all__" : "__pause_all__");
+    try {
+      if (enabled) await resumeAllWorkers();
+      else await pauseAllWorkers();
+      onChanged && onChanged();
+    } catch (err) {
+      setError(String(err.message || err));
+    } finally {
+      setBusyId("");
+    }
+  }
+
   if (!workers.length) {
     return (
       <div className="panel">
@@ -322,11 +358,30 @@ function WorkerTable({ status }) {
   }
   return (
     <div className="panel">
+      <div className="row worker-controls">
+        <button
+          type="button"
+          className="danger"
+          disabled={!!busyId}
+          onClick={() => all(false)}
+        >
+          {busyId === "__pause_all__" ? "Pausing..." : "Pause all"}
+        </button>
+        <button type="button" disabled={!!busyId} onClick={() => all(true)}>
+          {busyId === "__resume_all__" ? "Resuming..." : "Resume all"}
+        </button>
+        <span className="hint">
+          Pause stops new job assignment only; the process keeps polling. In-flight
+          units may still finish.
+        </span>
+      </div>
+      {error && <div className="error">{error}</div>}
       <table>
         <thead>
           <tr>
             <th>worker_id</th>
             <th>status</th>
+            <th>control</th>
             <th className="num">files done</th>
             <th className="num">in flight</th>
             <th className="num">units</th>
@@ -343,6 +398,20 @@ function WorkerTable({ status }) {
               <td className="mono">{w.worker_id}</td>
               <td>
                 <span className={`pill ${w.status}`}>{w.status}</span>
+              </td>
+              <td>
+                <button
+                  type="button"
+                  className={w.enabled === false ? "" : "danger"}
+                  disabled={!!busyId}
+                  onClick={() => toggle(w)}
+                >
+                  {busyId === w.worker_id
+                    ? "..."
+                    : w.enabled === false
+                    ? "Resume"
+                    : "Pause"}
+                </button>
               </td>
               <td className="num">{w.files_done.toLocaleString()}</td>
               <td className="num">{w.in_flight}</td>
@@ -363,7 +432,8 @@ function WorkerTable({ status }) {
       <div className="hint">
         EPM is measured over the last few minutes, so a busy VPS simply pulls fewer
         units. Nothing here is a fixed 1/N target. <code>rate-limited</code> means that
-        VPS is parked on an ORO 429 and will resume on its own.
+        VPS is parked on an ORO 429 and will resume on its own. <code>paused</code> is
+        a dashboard off switch.
       </div>
     </div>
   );
@@ -427,7 +497,7 @@ export default function App() {
       <StartRaceForm status={status} onStarted={refresh} />
       {status && <PhaseBar status={status} />}
       {status && <Totals status={status} />}
-      {status && <WorkerTable status={status} />}
+      {status && <WorkerTable status={status} onChanged={refresh} />}
       {status && <Events status={status} />}
       <p className="flaticon-credit">
         <a
