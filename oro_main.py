@@ -71,6 +71,26 @@ BIND_HOST = os.environ.get("BIND_HOST", "0.0.0.0")
 BIND_PORT = int(os.environ.get("BIND_PORT", "8080"))
 CLUSTER_TOKEN = os.environ.get("CLUSTER_TOKEN", "")
 ALLOWED_IPS = os.environ.get("ALLOWED_IPS", "")
+# How worker routes are gated when ALLOWED_IPS and/or CLUSTER_TOKEN are set:
+#   ip_and_token  IP allowlist AND token (default; previous behaviour)
+#   ip_or_token   IP allowlist OR valid token — use for home/VPN PCs whose
+#                 public IP changes; keep VPS IPs in ALLOWED_IPS, put the same
+#                 CLUSTER_TOKEN on each local PC
+#   ip            allowlist only (token ignored on worker routes)
+#   token         token only (any IP with the secret; ALLOWED_IPS ignored)
+_raw_worker_auth = (os.environ.get("WORKER_AUTH_MODE") or "ip_and_token").strip().lower()
+_WORKER_AUTH_ALIASES = {
+    "ip_and_token": "ip_and_token", "and": "ip_and_token", "both": "ip_and_token",
+    "ip_or_token": "ip_or_token", "or": "ip_or_token", "either": "ip_or_token",
+    "ip": "ip", "ip_only": "ip", "allowlist": "ip",
+    "token": "token", "token_only": "token",
+}
+WORKER_AUTH_MODE = _WORKER_AUTH_ALIASES.get(_raw_worker_auth, "")
+if not WORKER_AUTH_MODE:
+    # keep serving; fall back to the safe default
+    print(f"[main] ignoring unknown WORKER_AUTH_MODE={_raw_worker_auth!r}; "
+          f"using ip_and_token", flush=True)
+    WORKER_AUTH_MODE = "ip_and_token"
 TRUST_PROXY = os.environ.get("TRUST_PROXY", "0").strip() in ("1", "true", "yes")
 # dashboard login; the worker routes never use it
 UI_USER = os.environ.get("UI_USER", "")
@@ -1770,10 +1790,54 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     def _worker_gate(self) -> bool:
-        """Worker routes: IP allowlist, plus the token when one is configured.
+        """Worker routes: IP allowlist and/or CLUSTER_TOKEN (see WORKER_AUTH_MODE).
         These are the routes that write into the dataset."""
         allowed, ip = ip_allowed(self.client_address[0],
                                  self.headers.get("X-Forwarded-For"), ALLOW_NETS)
+        got_token = self.headers.get("X-Cluster-Token", "")
+        token_match = bool(CLUSTER_TOKEN) and got_token == CLUSTER_TOKEN
+
+        if WORKER_AUTH_MODE == "token":
+            if not CLUSTER_TOKEN:
+                self.close_connection = True
+                self._json(503, {"error": "WORKER_AUTH_MODE=token needs CLUSTER_TOKEN"})
+                return False
+            if token_match:
+                return True
+            self.close_connection = True
+            self._json(401, {"error": "bad or missing X-Cluster-Token"})
+            return False
+
+        if WORKER_AUTH_MODE == "ip":
+            if not allowed:
+                return self._forbid(ip, "not in ALLOWED_IPS",
+                                    f"{ip} is not in ALLOWED_IPS on this server")
+            return True
+
+        if WORKER_AUTH_MODE == "ip_or_token":
+            # Stable VPS IPs stay on the allowlist; home/VPN PCs send CLUSTER_TOKEN
+            # so a changing egress IP does not need a main restart.
+            if allowed:
+                return True
+            if not CLUSTER_TOKEN:
+                return self._forbid(
+                    ip, "not in ALLOWED_IPS",
+                    f"{ip} is not in ALLOWED_IPS on this server "
+                    f"(set CLUSTER_TOKEN for local/VPN workers)",
+                )
+            if token_match:
+                return True
+            self.close_connection = True
+            if got_token:
+                self._json(401, {"error": "bad X-Cluster-Token"})
+            else:
+                self._json(401, {
+                    "error": f"{ip} is not in ALLOWED_IPS; "
+                             f"send X-Cluster-Token (local/VPN worker)",
+                })
+            return False
+
+        # ip_and_token (default): previous behaviour
         if not allowed:
             return self._forbid(ip, "not in ALLOWED_IPS",
                                 f"{ip} is not in ALLOWED_IPS on this server")
@@ -2111,10 +2175,23 @@ def cmd_serve(_args) -> None:
     threading.Thread(target=expander, daemon=True, name="expander").start()
     server = Server((BIND_HOST, BIND_PORT), Handler)
     worker_gates = []
-    if ALLOW_NETS:
-        worker_gates.append(f"ip-allowlist({len(ALLOW_NETS)}+loopback)")
-    if CLUSTER_TOKEN:
-        worker_gates.append("token")
+    if WORKER_AUTH_MODE == "token":
+        worker_gates.append("token-only")
+    elif WORKER_AUTH_MODE == "ip":
+        if ALLOW_NETS:
+            worker_gates.append(f"ip-allowlist({len(ALLOW_NETS)}+loopback)")
+    elif WORKER_AUTH_MODE == "ip_or_token":
+        if ALLOW_NETS:
+            worker_gates.append(f"ip-allowlist({len(ALLOW_NETS)}+loopback)")
+        if CLUSTER_TOKEN:
+            worker_gates.append("token-or")
+        else:
+            worker_gates.append("ip-only(no-CLUSTER_TOKEN)")
+    else:
+        if ALLOW_NETS:
+            worker_gates.append(f"ip-allowlist({len(ALLOW_NETS)}+loopback)")
+        if CLUSTER_TOKEN:
+            worker_gates.append("token-and")
     ui_gates = []
     if UI_ALLOW_NETS:
         ui_gates.append(f"ip-allowlist({len(UI_ALLOW_NETS)}+loopback)")
@@ -2125,7 +2202,8 @@ def cmd_serve(_args) -> None:
     log(f"serving on http://{BIND_HOST}:{BIND_PORT}  data={DATA_DIR}  "
         f"ui={'dist' if DIST_DIR.exists() else 'not built'}")
     log(f"access: workers={'+'.join(worker_gates) if worker_gates else 'OPEN'}  "
-        f"dashboard={'+'.join(ui_gates) if ui_gates else 'OPEN'}")
+        f"dashboard={'+'.join(ui_gates) if ui_gates else 'OPEN'}  "
+        f"WORKER_AUTH_MODE={WORKER_AUTH_MODE}")
     if ALLOW_NETS:
         log("worker IPs: " + ", ".join(str(n) for n in ALLOW_NETS))
     if UI_ALLOW_NETS:
@@ -2135,6 +2213,9 @@ def cmd_serve(_args) -> None:
         log("WARNING: no ALLOWED_IPS and no CLUSTER_TOKEN - anyone who can reach "
             f"{BIND_HOST}:{BIND_PORT} can upload files into your data dir. "
             "Set ALLOWED_IPS in .env.")
+    if WORKER_AUTH_MODE == "ip_or_token" and ALLOW_NETS and not CLUSTER_TOKEN:
+        log("NOTE: WORKER_AUTH_MODE=ip_or_token but CLUSTER_TOKEN is empty; "
+            "local/VPN PCs cannot authenticate until you set one")
     if public and not ui_gates:
         log("WARNING: the dashboard is open to anyone who can reach "
             f"{BIND_HOST}:{BIND_PORT}, including starting races. "

@@ -1,5 +1,8 @@
 # OtherVPS.md — set up an EXTRA worker machine (Linux or Windows)
 
+> **Home / VPN PC with a changing public IP?** Use **LocalPC.md** instead of
+> editing `ALLOWED_IPS` every time: `WORKER_AUTH_MODE=ip_or_token` + `CLUSTER_TOKEN`.
+
 An extra machine runs one process, `oro-worker`. It:
 
 - **listens on no port at all** — it is an HTTP client, like a browser,
