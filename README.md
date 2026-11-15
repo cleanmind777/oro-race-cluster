@@ -1,12 +1,12 @@
 # ORO race-log cluster
 
-Downloads **raw** public ORO race logs onto one MAIN VPS, using any number of extra
-machines as helpers. Extra machines wait under PM2, **pull** small units of work from
-main, and upload each file to main the moment it is downloaded. Main downloads too.
-Everything is driven from a React dashboard on main.
+Downloads **raw** public ORO race (and qualifying) logs onto one MAIN VPS, using any
+number of extra machines as helpers — VPS or local/VPN PCs. Extra machines wait under
+PM2, **pull** small units of work from main, and upload each file to main the moment it
+is downloaded. Main downloads too. Everything is driven from a React dashboard on main.
 
 ```
-  extra VPS (no open port)                 MAIN VPS (one port, 8080)
+  extra VPS / local PC (no open port)      MAIN VPS (one port, 8080)
   ┌──────────────────────┐                 ┌─────────────────────────────┐
   │ oro-worker (PM2)     │  GET /api/work  │ oro-main (PM2)              │
   │   long-poll for work │ ──────────────► │   API + React dist/         │
@@ -17,8 +17,9 @@ Everything is driven from a React dashboard on main.
 ```
 
 **Step-by-step setup:** [MainVPS.md](MainVPS.md) for the main server,
-[OtherVPS.md](OtherVPS.md) for each extra machine (Linux and Windows). This file is the
-reference for how the whole thing works.
+[OtherVPS.md](OtherVPS.md) for each extra Linux/Windows VPS,
+[LocalPC.md](LocalPC.md) for home/office PCs whose VPN public IP changes.
+This file is the reference for how the whole thing works.
 
 Why a cluster: `api.oroagents.com` allows roughly **100 requests/min per public IP**, and
 a full race is ~300 included eval runs × ~90 episodes. One IP is too slow. Extra machines
@@ -35,6 +36,7 @@ only help if they have **different public IPs**.
 | `ecosystem.worker.cjs` | PM2: `oro-worker` on each extra VPS |
 | `pm2_start.cjs` | makes `pm2 start ecosystem.*.cjs` work (see note below) |
 | `.env.example` | template for `.env`, the single config file |
+| `LocalPC.md` | home/VPN workers via `WORKER_AUTH_MODE=ip_or_token` |
 
 > PM2 only auto-detects config files named `*.config.cjs`, `*.json` or `*.yaml`, so
 > `pm2 start ecosystem.main.cjs` would otherwise run the config as a script instead of
@@ -44,7 +46,8 @@ only help if they have **different public IPs**.
 
 ## Install
 
-Both Python files are stdlib only — no pip packages.
+Both Python files are stdlib only — no pip packages on Linux. On **Windows**, also
+install a CA bundle so HTTPS to ORO verifies:
 
 ```bash
 # every machine
@@ -52,12 +55,16 @@ python3 --version            # 3.9+
 npm install -g pm2
 cp .env.example .env         # then edit it
 
+# Windows workers (UCRT64 / PowerShell)
+python -m pip install --upgrade certifi
+
 # main only (build the UI once; oro-main serves it)
 cd frontend && npm install && npm run build && cd ..
 ```
 
 Windows: same files, same commands. Use `python` instead of `python3` if that is what is
-on PATH, by putting `PYTHON=python` in `.env`.
+on PATH, by putting `PYTHON=python` in `.env`. The worker loads `certifi` (or
+`SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE`) automatically.
 
 ## Configure
 
@@ -80,13 +87,18 @@ values. A real environment variable still wins for a one-off,
 | `UI_USER` / `UI_PASSWORD` | main | *(empty = no login)* | dashboard login (HTTP Basic) |
 | `UI_ALLOWED_IPS` | main | *(empty = any IP)* | optional extra IP restriction for the dashboard |
 | `UI_MAX_FAILS` / `UI_BAN_SEC` | main | `10` / `300` | wrong-password brake; the correct password always works |
-| `CLUSTER_TOKEN` | all | *(empty = disabled)* | optional shared secret for **worker** routes |
+| `CLUSTER_TOKEN` | all | *(empty = disabled)* | shared secret for **worker** routes; required for local/VPN PCs with `ip_or_token` |
+| `WORKER_AUTH_MODE` | main | `ip_and_token` | `ip_and_token` / `ip_or_token` / `ip` / `token` — see [LocalPC.md](LocalPC.md) |
 | `TRUST_PROXY` | main | `0` | `1` only behind your own reverse proxy |
 | `BIND_HOST` | main | `0.0.0.0` | `127.0.0.1` when proxying, or a VPN address |
 | `BIND_PORT` | main | `8080` | the only listening port in the cluster |
 | `DATA_DIR` | main | `./Data/races` | the only durable copy |
+| `QUALIFYING_MIN_SCORE` | main | `0.55` | min `final_score` for qualifying downloads |
+| `UPDATE_TASK_DICTIONARY` | main | `1` | rebuild `task_dictionary.json` after a download finishes |
+| `PUSH_ORO_LOGS` | main | `1` | staged git commit/push of the finished label under `ORO_LOGS_GIT_DIR` |
+| `ORO_LOGS_GIT_DIR` | main | next to the dictionary script | git repo for staged pushes |
 | `MAIN_ORO_MAX_RPM` | main | `49` | cap for main's metadata fetch |
-| `MAIN_URL` | extra VPS | `http://127.0.0.1:<BIND_PORT>` | **must include the port** |
+| `MAIN_URL` | extra VPS / PC | `http://127.0.0.1:<BIND_PORT>` | **must include the port** |
 | `WORKER_ID` | workers | hostname | unique per machine |
 | `WORKER_THREADS` | workers | `4` | ORO threads, all under one limiter |
 | `ORO_MAX_RPM` | workers | `98` | per **process** cap toward ORO; use `49` on main |
@@ -117,7 +129,7 @@ The startup log states the access policy it ended up with:
 
 ```
 serving on http://0.0.0.0:8080  data=...  ui=dist
-access: workers=ip-allowlist(2+loopback)  dashboard=login(admin)
+access: workers=ip-allowlist(2+loopback)+token-or  dashboard=login(admin)  WORKER_AUTH_MODE=ip_or_token
 worker IPs: 203.0.113.20/32, 198.51.100.30/32
 ```
 
@@ -127,6 +139,10 @@ a `.env` holding `MAIN_URL` and `WORKER_ID`, then:
 ```bash
 pm2 start ecosystem.worker.cjs && pm2 save && pm2 startup
 ```
+
+**Local / VPN PC** — same worker files; set `CLUSTER_TOKEN` to match main and use
+`WORKER_AUTH_MODE=ip_or_token` on main so a changing VPN egress IP does not need an
+allowlist edit. Details: [LocalPC.md](LocalPC.md).
 
 Workers now **wait**. Starting PM2 does not start a race — they long-poll `/api/work`
 and show up in the UI as `waiting`. If `pm2 startup` is unreliable (common on Windows),
@@ -140,7 +156,8 @@ Only on main. Workers need no command.
 **UI** — open `http://<main-ip>:8080`. The browser asks for `UI_USER` / `UI_PASSWORD`,
 then you paste the `race_id`, optionally a label (default is `race<race_number>` from
 `race.json`), and press **Start race**. The cluster-token field stays empty unless you
-also set `CLUSTER_TOKEN`.
+also set `CLUSTER_TOKEN` (that field is for the *browser* talking to worker-gated
+routes; local workers put the token in their own `.env`).
 
 **CLI**
 
@@ -149,6 +166,20 @@ python3 oro_main.py start --race-id 51abddf9-0ea6-4afb-9b19-bd0bdc182af6 --label
 ```
 
 Both work while `oro-main` is already serving; the CLI just POSTs to it.
+
+### Qualifying logs (leaderboard filter)
+
+To download **QUALIFYING** episode logs for public-leaderboard agents with
+`final_score >= QUALIFYING_MIN_SCORE` (default `0.55`):
+
+- **UI** — **Start qualifying** (min score + label, default label `qualifying`)
+- **CLI** — `python3 oro_main.py start-qualifying [--min-score 0.55] [--label qualifying]`
+- **API** — `POST /api/qualifying` with optional `{min_score, label}`
+
+Same cluster path as a race (`race_id` is the synthetic id `qualifying`). Main pages the
+public leaderboard, writes `leaderboard_selected.json`, then enqueues each agent's
+`runs.json` and only keeps runs with `phase == "QUALIFYING"`. There is no publication
+watcher.
 
 ### A race whose logs are not public yet
 
@@ -185,31 +216,58 @@ the metadata phase (with its own file counter), then the episode phase, cluster
 done/remaining/in-flight, files per minute, ETA, and a row per VPS with its recent EPM,
 in-flight count, 429 count, bytes landed on main and last-seen age.
 
+**Pause / resume workers** from the dashboard (per row, or Pause all / Resume all). That
+only stops **new job assignment** on main; the worker process keeps polling. In-flight
+units may still finish. Paused ids are stored in `.oro-worker-control.json` and survive
+a main restart. Status shows `paused`.
+
 ## What gets downloaded
 
 ```
 Data/races/<label>/
-  race.json
+  race.json                         # races only
+  leaderboard_selected.json         # qualifying only
   agents/<agent_version_id>/runs.json
   agents/<agent_version_id>/<eval_run_id>/evaluation_run.json
   agents/<agent_version_id>/<eval_run_id>/episodes/<episode_result_id>.json
 ```
 
 Every file is the **unmodified response body** — no pretty-printing, no derived files.
-Agents come from `race.json` → `qualifiers[]`. A run is included only when its `race_id`
-matches, `phase == "RACE"`, `is_included == true`, and status is not `STALE`. Episodes
-come from `evaluation_run.json` → `items.items[].episode_result_id`. `AGENT_CODE`,
-`EVAL_LOGS_BUNDLE` and `EVAL_PROBLEM_LOGS` are never requested.
 
-Endpoints used: `/v1/public/races/{id}`, `/v1/public/agent-versions/{id}/runs`,
-`/v1/public/evaluation-runs/{id}`, `/v1/public/episode-results/{id}/feedback`.
+**Race:** agents come from `race.json` → `qualifiers[]`. A run is included only when its
+`race_id` matches, `phase == "RACE"`, `is_included == true`, and status is not `STALE`.
+
+**Qualifying:** agents come from `/v1/public/leaderboard` with `final_score >=` the
+threshold. A run is included when `phase == "QUALIFYING"`, `is_included == true`, and
+status is not `STALE`.
+
+Episodes come from `evaluation_run.json` → `items.items[].episode_result_id`.
+`AGENT_CODE`, `EVAL_LOGS_BUNDLE` and `EVAL_PROBLEM_LOGS` are never requested.
+
+Endpoints used: `/v1/public/races/{id}`, `/v1/public/leaderboard`,
+`/v1/public/agent-versions/{id}/runs`, `/v1/public/evaluation-runs/{id}`,
+`/v1/public/episode-results/{id}/feedback`.
+
+## After a download finishes
+
+With the defaults enabled, main then:
+
+1. Rebuilds `task_dictionary.json` (`UPDATE_TASK_DICTIONARY=1`) via
+   `TASK_DICTIONARY_SCRIPT`.
+2. Commits and pushes the finished label in ~10% batches under `ORO_LOGS_GIT_DIR`
+   (`PUSH_ORO_LOGS=1`). Messages look like `add: Race 22 (i/total)` or
+   `add: Qualifying (i/total)`, then `update: task_dictionary.json`.
+
+Do not restart `oro-main` while that background push is still running, or the push can be
+cut off (re-run by refreshing the dictionary for that label if needed).
 
 ## Resume
 
 Main remembers the running race in `.oro-main-state.json`, so a crash, a `pm2 restart` or
 a reboot continues by itself (`AUTO_RESUME=1`, the default) — the startup log says
 `resumed race ...`. Stopping a race, from the dashboard button or
-`python3 oro_main.py stop`, clears that marker, so a stop stays stopped.
+`python3 oro_main.py stop`, clears that marker, so a stop stays stopped. Qualifying
+resumes the same way when `race_id` is `qualifying`.
 
 Either way the work is picked up from disk: files that already exist with size > 0 are
 skipped on enqueue, again when a unit is handed out, and again on the worker itself. The
@@ -238,6 +296,7 @@ exactly **one** unit per request:
 - A file that keeps failing is dropped after `MAX_ITEM_FAILURES` attempts (default 3) and
   counted as *unavailable*, so one episode that is permanently 404 cannot hold the race
   open for ever.
+- Dashboard-**paused** workers stay connected but are never assigned units.
 - The race is done when the queue is empty and nothing is in flight.
 
 **Metadata is distributed too.** `runs.json` and `evaluation_run.json` are work units of
@@ -285,7 +344,7 @@ outbound already, so no inbound rule is needed on a worker.
 
 ```
 main:    the port is public when you want the dashboard reachable from anywhere,
-         so ALLOWED_IPS is what protects /api/upload - keep it set.
+         so ALLOWED_IPS / CLUSTER_TOKEN is what protects /api/upload - keep them set.
          To lock everything down instead: allow inbound BIND_PORT only from
          worker IPs, and reach the UI through ssh -L or a VPN.
 workers: allow outbound 443 + outbound to main's BIND_PORT; no inbound rule
@@ -309,16 +368,22 @@ upload rights, and a worker token grants **no** dashboard access.
 
 | Routes | Gate |
 | --- | --- |
-| `GET /api/work`, `PUT /api/upload`, `POST /api/work/*` | `ALLOWED_IPS` + `CLUSTER_TOKEN` if set |
-| dashboard, `/api/status`, `/api/workers`, `POST /api/races` | `UI_USER`/`UI_PASSWORD` + `UI_ALLOWED_IPS` if set |
+| `GET /api/work`, `PUT /api/upload`, `POST /api/work/*` | `ALLOWED_IPS` and/or `CLUSTER_TOKEN` per `WORKER_AUTH_MODE` |
+| dashboard, `/api/status`, `/api/workers`, `POST /api/races`, `POST /api/qualifying`, worker pause/resume | `UI_USER`/`UI_PASSWORD` + `UI_ALLOWED_IPS` if set |
 | `GET /api/health` | open, for uptime checks |
 
-**Worker routes — `ALLOWED_IPS`.** These write into your dataset, so they must never be
-reachable by the internet at large. Comma-separated IPs and CIDR blocks; `127.0.0.0/8`
-and `::1` are always allowed so main's own worker and CLI keep working. Blocked requests
-get `403` naming the IP main saw, logged at most once per IP per minute. Empty means any
-IP may upload — never leave it empty on a public port. `CLUSTER_TOKEN` is an optional
-second factor here.
+**Worker routes — `ALLOWED_IPS` + `WORKER_AUTH_MODE`.** These write into your dataset.
+Comma-separated IPs and CIDR blocks; `127.0.0.0/8` and `::1` are always allowed so main's
+own worker and CLI keep working. Blocked requests get `403` naming the IP main saw,
+logged at most once per IP per minute. Empty `ALLOWED_IPS` means any IP may pass the IP
+check — never leave both allowlist and token empty on a public port.
+
+| `WORKER_AUTH_MODE` | Meaning |
+| --- | --- |
+| `ip_and_token` | Default. Allowlist (if set) **and** token (if set). |
+| `ip_or_token` | Allowlist **or** valid token — VPS by IP, home/VPN PC by token ([LocalPC.md](LocalPC.md)). |
+| `ip` | Allowlist only. |
+| `token` | Token only (any IP with the secret). |
 
 **Dashboard — `UI_USER` / `UI_PASSWORD`.** HTTP Basic, so the browser prompts natively.
 After `UI_MAX_FAILS` wrong passwords from one IP, further wrong guesses get `429` for
@@ -360,29 +425,39 @@ briefly down. There is no end-of-job tar or rsync, so Windows workers need no ex
 | Route | Auth | Purpose |
 | --- | --- | --- |
 | `GET /api/health` | none | liveness |
-| `GET /api/status` | UI login | everything the UI shows |
+| `GET /api/status` | UI login | everything the UI shows (incl. `enabled` / `paused` per worker) |
 | `GET /api/workers` | UI login | per-VPS detail |
 | `POST /api/races` | UI login | `{race_id, label}` — start/resume a race |
+| `POST /api/qualifying` | UI login | `{min_score?, label?}` — qualifying download |
 | `POST /api/races/stop` | UI login | stop the race, keep the files, do not auto-resume |
-| `GET /api/work?worker_id=` | IP + token | long-poll ~60s → `204` idle, or `200` one unit |
-| `PUT /api/upload?label=&relpath=&worker_id=&job_id=` | IP + token | raw body = file bytes; idempotent |
-| `POST /api/work/{job_id}/progress` | IP + token | `{done_relpaths, bytes, new_429}` heartbeat |
-| `POST /api/work/{job_id}/done` | IP + token | unit finished |
-| `POST /api/work/{job_id}/fail` | IP + token | remaining items return to the queue |
+| `POST /api/workers/{id}/pause` | UI login | stop assigning new jobs to that worker |
+| `POST /api/workers/{id}/resume` | UI login | allow jobs again |
+| `POST /api/workers/pause-all` | UI login | pause every known worker |
+| `POST /api/workers/resume-all` | UI login | clear the paused set |
+| `GET /api/work?worker_id=` | worker gate | long-poll ~60s → `204` idle, or `200` one unit |
+| `PUT /api/upload?label=&relpath=&worker_id=&job_id=` | worker gate | raw body = file bytes; idempotent |
+| `POST /api/work/{job_id}/progress` | worker gate | `{done_relpaths, bytes, new_429}` heartbeat |
+| `POST /api/work/{job_id}/done` | worker gate | unit finished |
+| `POST /api/work/{job_id}/fail` | worker gate | remaining items return to the queue |
+
+CLI extras: `python3 oro_main.py start-qualifying [--min-score 0.55] [--label qualifying]`.
 
 ## Troubleshooting
 
 | Symptom | Cause |
 | --- | --- |
 | worker logs `main unreachable` | `MAIN_URL` missing the port, or main's firewall blocks the worker IP |
-| worker logs `401` | `CLUSTER_TOKEN` differs from main's (or main has one and the worker does not) |
-| worker logs `403` | that worker's public IP is not in main's `ALLOWED_IPS` |
+| worker logs `401` | `CLUSTER_TOKEN` differs from main's (or local PC missing the token under `ip_or_token`) |
+| worker logs `403` | that worker's public IP is not in main's `ALLOWED_IPS` (or use `ip_or_token` + token for VPN PCs) |
+| Windows: `SSL: CERTIFICATE_VERIFY_FAILED` | `python -m pip install --upgrade certifi`, restart the worker |
 | UI says `cannot reach oro-main` | `oro-main` is down (`pm2 logs oro-main`) |
 | browser keeps asking for the password | `UI_USER`/`UI_PASSWORD` typo in `.env`; check `pm2 logs oro-main` for the active policy |
 | `429 too many failed logins` | wrong password tried too often from your IP; the correct one still works immediately |
-| `403 ... is not in ALLOWED_IPS` | a **worker's** IP is missing from `ALLOWED_IPS`; add it and restart `oro-main` |
+| `403 ... is not in ALLOWED_IPS` | a **worker's** IP is missing from `ALLOWED_IPS`; add it and `pm2 start ecosystem.main.cjs` |
 | `403 ... is not in UI_ALLOWED_IPS` | you restricted the dashboard by IP; add yours, or tunnel in: `ssh -L 8080:127.0.0.1:8080 main` |
 | plain page saying the build is missing | run `npm run build` in `frontend/` |
 | many 429s on one machine | that IP has other ORO traffic; lower its `ORO_MAX_RPM` |
 | extra VPS does not speed things up | it shares a public IP with another worker |
 | `409 race already running` | wait for the current race, or it is still fetching metadata |
+| worker stuck `paused` | resume it from the dashboard, or `POST /api/workers/{id}/resume` |
+| race finished but no git push | main was restarted mid-push; re-run the dictionary/push for that label |
